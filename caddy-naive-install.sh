@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ==============================================================
-# 脚本名称: caddy-final.sh
+# 脚本名称: caddy-fixed.sh
 # 功能: 智能容错证书申请 + 泛域名自动推导 + BBR/内核优化
-# 架构: AMD64 / ARM64
+# 修复: 解决了 EOF 格式导致的语法错误
 # ==============================================================
 
 # 颜色定义
@@ -30,7 +30,6 @@ PORT_RANGE_END=3610
 optimize_system() {
     echo -e "${YELLOW}正在检查系统内核状态...${PLAIN}"
     
-    # 简单检查 BBR 是否开启
     if sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
         echo -e "${GREEN}BBR 已开启，跳过优化。${PLAIN}"
         return
@@ -39,7 +38,7 @@ optimize_system() {
     echo -e "${YELLOW}正在应用内核优化 (参考 v2ray-agent)...${PLAIN}"
     cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%F)
     
-    cat >> /etc/sysctl.conf <<EOF
+cat >> /etc/sysctl.conf <<EOF_SYSCTL
 fs.file-max = 1000000
 fs.inotify.max_user_instances = 8192
 net.ipv4.tcp_syncookies = 1
@@ -61,7 +60,8 @@ net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-EOF
+EOF_SYSCTL
+
     sysctl -p >/dev/null 2>&1
     
     if ! grep -q "ulimit -SHn 65535" /etc/profile; then
@@ -165,4 +165,146 @@ check_and_issue_cert() {
     if [[ "$NEED_ISSUE" -eq 1 ]]; then
         echo -e "${YELLOW}请输入 Cloudflare API Token:${PLAIN}"
         read -p "CF_Token: " CF_TOKEN
-        [[ -z "$CF_TOKEN" ]] && echo -e "${RED}Token为空${
+        [[ -z "$CF_TOKEN" ]] && echo -e "${RED}Token为空${PLAIN}" && exit 1
+
+        "$ACME_SH_DIR/acme.sh" --set-default-ca --server letsencrypt
+
+        echo -e "${YELLOW}开始申请/恢复证书 (${WILDCARD_DOMAIN})...${PLAIN}"
+        export CF_Token="$CF_TOKEN"
+        
+        # 尝试申请
+        "$ACME_SH_DIR/acme.sh" --issue --server letsencrypt --dns dns_cf -d "$WILDCARD_DOMAIN" -k ec-256
+        
+        # 强制安装
+        echo -e "${YELLOW}正在尝试安装证书到指定目录...${PLAIN}"
+        "$ACME_SH_DIR/acme.sh" --install-cert -d "$WILDCARD_DOMAIN" --ecc \
+            --fullchain-file "$CERT_FILE" \
+            --key-file       "$KEY_FILE" \
+            --reloadcmd      "systemctl reload caddy"
+            
+        if [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]]; then
+             echo -e "${GREEN}证书安装成功！${PLAIN}"
+        else
+             echo -e "${RED}错误：证书安装失败！${PLAIN}"
+             echo -e "${YELLOW}请检查 Token 权限或 acme.sh 日志。${PLAIN}"
+             exit 1
+        fi
+    fi
+}
+
+# 6. 配置 Caddy
+config_caddy() {
+    echo -e "${YELLOW}正在生成配置文件...${PLAIN}"
+    read -p "设置 NaiveProxy 用户名 [默认: admin]: " NAIVE_USER
+    [[ -z "$NAIVE_USER" ]] && NAIVE_USER="admin"
+    read -p "设置 NaiveProxy 密码 [默认: admin]: " NAIVE_PASS
+    [[ -z "$NAIVE_PASS" ]] && NAIVE_PASS="admin"
+
+    mkdir -p $CADDY_DIR
+    mkdir -p /var/www/html
+    if [[ ! -f /var/www/html/index.html ]]; then
+        echo "<h1>It works!</h1>" > /var/www/html/index.html
+    fi
+    
+cat > $CADDY_DIR/Caddyfile <<EOF_CADDY
+{
+    admin off
+    auto_https off
+    servers {
+        protocol {
+            experimental_http3
+        }
+    }
+    order forward_proxy before file_server
+}
+
+:$PORT_MAIN, $WILDCARD_DOMAIN:$PORT_MAIN {
+    tls $CERT_DIR/wildcard.${ROOT_DOMAIN}.crt $CERT_DIR/wildcard.${ROOT_DOMAIN}.key
+    
+    forward_proxy {
+        basic_auth $NAIVE_USER $NAIVE_PASS
+        hide_ip
+        hide_via
+        probe_resistance
+    }
+    
+    file_server {
+        root /var/www/html
+    }
+}
+EOF_CADDY
+}
+
+# 7. 服务与防火墙
+setup_service() {
+    echo -e "${YELLOW}配置系统服务...${PLAIN}"
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -t nat -D PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN 2>/dev/null
+        iptables -t nat -A PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN
+        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save
+    fi
+
+cat > /etc/systemd/system/caddy.service <<EOF_SERVICE
+[Unit]
+Description=Caddy Web Server
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+User=root
+Group=root
+ExecStart=/usr/bin/caddy run --environ --config $CADDY_DIR/Caddyfile
+ExecReload=/usr/bin/caddy reload --config $CADDY_DIR/Caddyfile
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+LimitNPROC=512
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+
+    systemctl daemon-reload
+    systemctl enable caddy
+    systemctl restart caddy
+    
+    sleep 2
+    if systemctl is-active --quiet caddy; then
+        echo -e "${GREEN}Caddy 启动成功！${PLAIN}"
+    else
+        echo -e "${RED}Caddy 启动失败，请检查配置。${PLAIN}"
+        exit 1
+    fi
+}
+
+show_info() {
+    echo ""
+    echo -e "${GREEN}=== 部署完成 ===${PLAIN}"
+    echo -e "具体域名:   ${YELLOW}${INPUT_DOMAIN}${PLAIN}"
+    echo -e "泛域名证书: ${YELLOW}${WILDCARD_DOMAIN}${PLAIN}"
+    echo -e "端口:       ${YELLOW}${PORT_MAIN}${PLAIN}"
+    echo -e "用户名:     ${YELLOW}${NAIVE_USER}${PLAIN}"
+    echo -e "密码:       ${YELLOW}${NAIVE_PASS}${PLAIN}"
+    echo ""
+    echo -e "${GREEN}客户端配置 (config.json):${PLAIN}"
+    echo -e "\033[36m{"
+    echo -e "  \"listen\": \"socks://127.0.0.1:1080\","
+    echo -e "  \"proxy\": \"https://$NAIVE_USER:$NAIVE_PASS@$INPUT_DOMAIN:$PORT_MAIN\""
+    echo -e "}\033[0m"
+}
+
+main() {
+    check_system
+    install_dependencies
+    optimize_system
+    download_caddy
+    check_and_issue_cert
+    config_caddy
+    setup_service
+    show_info
+}
+
+main
