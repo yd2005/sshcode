@@ -1,3 +1,5 @@
+## 🚀 快速开始 (Getting Started)
+
 ```bash
 wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/yd2005/sshcode/refs/heads/main/caddy-naive-install.sh" && chmod 700 /root/caddy-naive-install.sh && /root/caddy-naive-install.sh
 ```
@@ -44,10 +46,3 @@ wget -P /root -N --no-check-certificate "https://raw.githubusercontent.com/yd200
 - [Caddy Server](https://caddyserver.com/) v2.x 已安装
 - `curl` 和 `jq` (用于 API 交互)
 - 域名服务商的 API Key (如 Cloudflare, AliYun 等)
-
-## 🚀 快速开始 (Getting Started)
-
-### 1. 克隆仓库
-```bash
-git clone [https://github.com/username/project-name.git](https://github.com/username/project-name.git)
-cd project-name
