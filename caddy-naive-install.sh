@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ==============================================================
-# 脚本名称: caddy-fixed.sh
-# 功能: 智能容错证书申请 + 泛域名自动推导 + BBR/内核优化
-# 修复: 解决了 EOF 格式导致的语法错误
+# 脚本名称: caddy-final-fix.sh
+# 功能: 修复 Caddyfile 配置错误 + 智能容错证书 + 泛域名
+# 修复: 彻底移除了导致启动失败的 experimental_http3 配置
 # ==============================================================
 
 # 颜色定义
@@ -35,7 +35,7 @@ optimize_system() {
         return
     fi
 
-    echo -e "${YELLOW}正在应用内核优化 (参考 v2ray-agent)...${PLAIN}"
+    echo -e "${YELLOW}正在应用内核优化...${PLAIN}"
     cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%F)
     
 cat >> /etc/sysctl.conf <<EOF_SYSCTL
@@ -186,7 +186,6 @@ check_and_issue_cert() {
              echo -e "${GREEN}证书安装成功！${PLAIN}"
         else
              echo -e "${RED}错误：证书安装失败！${PLAIN}"
-             echo -e "${YELLOW}请检查 Token 权限或 acme.sh 日志。${PLAIN}"
              exit 1
         fi
     fi
@@ -206,15 +205,11 @@ config_caddy() {
         echo "<h1>It works!</h1>" > /var/www/html/index.html
     fi
     
+# 【关键修复】这里彻底移除了 servers { protocol } 配置
 cat > $CADDY_DIR/Caddyfile <<EOF_CADDY
 {
     admin off
     auto_https off
-    servers {
-        protocol {
-            experimental_http3
-        }
-    }
     order forward_proxy before file_server
 }
 
