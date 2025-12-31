@@ -1,9 +1,8 @@
 #!/bin/bash
 
 # ==============================================================
-# 脚本名称: caddy-naive-download.sh (v2ray-agent内核复刻版)
-# 功能: Caddy+NaiveProxy 下载部署 & 参考级证书申请逻辑
-# 架构: AMD64 / ARM64
+# 脚本名称: caddy-naive-download.sh (Let's Encrypt 强制版)
+# 功能: Caddy+NaiveProxy 下载部署 & 强制 Let's Encrypt 证书
 # ==============================================================
 
 # 颜色定义
@@ -40,9 +39,9 @@ check_system() {
     echo -e "${GREEN}系统架构检测通过: $ARCH${PLAIN}"
 }
 
-# 2. 安装系统依赖 (参考 install.sh 的 installTools 函数)
+# 2. 安装系统依赖 (复刻 install.sh 的依赖列表)
 install_dependencies() {
-    echo -e "${YELLOW}正在安装系统依赖 (curl, wget, socat, cron, openssl)...${PLAIN}"
+    echo -e "${YELLOW}正在安装系统依赖...${PLAIN}"
     if [ -f /etc/debian_version ]; then
         apt-get update -y
         apt-get install -y curl wget socat cron openssl tar jq libnss3-tools iptables-persistent netfilter-persistent
@@ -77,7 +76,7 @@ download_caddy() {
     fi
 }
 
-# 4. 证书申请 (完全复刻 install.sh 的 acmeInstallSSL 逻辑)
+# 4. 证书申请 (强制 Let's Encrypt + ECC)
 check_and_issue_cert() {
     mkdir -p "$CERT_DIR"
     
@@ -87,7 +86,7 @@ check_and_issue_cert() {
     CERT_FILE="$CERT_DIR/${DOMAIN}.crt"
     KEY_FILE="$CERT_DIR/${DOMAIN}.key"
     
-    # 安装 acme.sh (参考 install.sh 的 installTools)
+    # 安装 acme.sh
     if [[ ! -f "$ACME_SH_DIR/acme.sh" ]]; then
         echo -e "${YELLOW}正在安装 acme.sh...${PLAIN}"
         curl -s https://get.acme.sh | sh -s email=admin@${DOMAIN}
@@ -101,7 +100,7 @@ check_and_issue_cert() {
     fi
 
     # 获取 Cloudflare Token
-    echo -e "${YELLOW}请输入 Cloudflare API Token (参考 v2ray-agent 仅需 DNS 编辑权限):${PLAIN}"
+    echo -e "${YELLOW}请输入 Cloudflare API Token (仅需 DNS 编辑权限):${PLAIN}"
     read -p "CF_Token: " CF_TOKEN
     
     if [[ -z "$CF_TOKEN" ]]; then
@@ -109,30 +108,28 @@ check_and_issue_cert() {
         exit 1
     fi
 
+    # =========================================================
+    # 核心修改：强制切换默认 CA 为 Let's Encrypt
+    # =========================================================
+    echo -e "${YELLOW}设置默认 CA 为 Let's Encrypt...${PLAIN}"
+    "$ACME_SH_DIR/acme.sh" --set-default-ca --server letsencrypt
+
     echo -e "${YELLOW}开始申请证书 (ECC-256)...${PLAIN}"
     
-    # =========================================================
-    # 核心复刻点：不进行API预检，直接通过环境变量传参给 acme.sh
-    # 对应 install.sh 中 acmeInstallSSL 函数的逻辑
-    # 强制使用 --server letsencrypt 和 -k ec-256 (ECC证书)
-    # =========================================================
-    
+    # 传递环境变量并申请
     export CF_Token="$CF_TOKEN"
     
-    # 申请证书
+    # 强制指定 --server letsencrypt 和 -k ec-256 (参考 install.sh)
     "$ACME_SH_DIR/acme.sh" --issue --server letsencrypt --dns dns_cf -d "$DOMAIN" -k ec-256
     
     local RET=$?
     if [[ $RET -ne 0 ]]; then
         echo -e "${RED}证书申请失败！错误代码: $RET${PLAIN}"
-        echo -e "${YELLOW}建议检查：${PLAIN}"
-        echo -e "1. Token 是否有 'Zone:DNS:Edit' 权限"
-        echo -e "2. 域名是否已托管在 Cloudflare"
+        echo -e "${YELLOW}请检查 Token 权限或域名解析是否正确。${PLAIN}"
         exit 1
     fi
 
-    # 安装证书 (对应 install.sh 的 installTLS 函数)
-    # 注意：install.sh 使用了 --ecc 参数，我们也必须加上
+    # 安装证书 (保留 ECC 参数)
     "$ACME_SH_DIR/acme.sh" --install-cert -d "$DOMAIN" --ecc \
         --fullchain-file "$CERT_FILE" \
         --key-file       "$KEY_FILE" \
@@ -140,8 +137,6 @@ check_and_issue_cert() {
         
     if [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]]; then
         echo -e "${GREEN}证书安装成功！${PLAIN}"
-        echo -e "Cert: $CERT_FILE"
-        echo -e "Key:  $KEY_FILE"
     else
         echo -e "${RED}证书文件未生成，请检查日志。${PLAIN}"
         exit 1
@@ -163,7 +158,7 @@ config_caddy() {
         echo "<h1>It works!</h1>" > /var/www/html/index.html
     fi
     
-    # 注意：这里引用了上面生成的 .crt 和 .key 文件路径
+    # 使用生成的证书路径
     cat > $CADDY_DIR/Caddyfile <<EOF
 {
     admin off
