@@ -1,10 +1,9 @@
 #!/bin/bash
 
 # ==============================================================
-# 脚本名称: caddy-naive-download.sh (完美复刻参考版逻辑)
-# 功能: Caddy+NaiveProxy 下载部署 & 证书管理
+# 脚本名称: caddy-naive-download.sh (v2ray-agent内核复刻版)
+# 功能: Caddy+NaiveProxy 下载部署 & 参考级证书申请逻辑
 # 架构: AMD64 / ARM64
-# 下载源: https://github.com/yd2005/Actions-P3TERX/releases/download/build-4/
 # ==============================================================
 
 # 颜色定义
@@ -16,10 +15,10 @@ PLAIN='\033[0m'
 # 下载源配置
 BASE_URL="https://github.com/yd2005/Actions-P3TERX/releases/download/build-4"
 
-# 路径与端口配置
+# 路径配置
 CADDY_DIR="/etc/caddy"
 CERT_DIR="/etc/naiveproxy/certs"
-ACME_SH_DIR="/root/.acme.sh"
+ACME_SH_DIR="$HOME/.acme.sh"
 PORT_MAIN=8443
 PORT_RANGE_START=3600
 PORT_RANGE_END=3610
@@ -39,29 +38,31 @@ check_system() {
         exit 1
     fi
     echo -e "${GREEN}系统架构检测通过: $ARCH${PLAIN}"
-    echo -e "${GREEN}即将下载文件: $FILE_NAME${PLAIN}"
 }
 
-# 2. 安装系统依赖 (参考脚本逻辑)
+# 2. 安装系统依赖 (参考 install.sh 的 installTools 函数)
 install_dependencies() {
-    echo -e "${YELLOW}正在安装系统依赖...${PLAIN}"
-    apt-get update -y
-    apt-get install -y curl wget git tar socat jq openssl cron iptables-persistent netfilter-persistent libnss3-tools
+    echo -e "${YELLOW}正在安装系统依赖 (curl, wget, socat, cron, openssl)...${PLAIN}"
+    if [ -f /etc/debian_version ]; then
+        apt-get update -y
+        apt-get install -y curl wget socat cron openssl tar jq libnss3-tools iptables-persistent netfilter-persistent
+    elif [ -f /etc/redhat-release ]; then
+        yum install -y curl wget socat cronie openssl tar jq
+    fi
 }
 
-# 3. 下载 Caddy (替代编译)
+# 3. 下载 Caddy
 download_caddy() {
-    echo -e "${YELLOW}正在从 GitHub 下载定制版 Caddy...${PLAIN}"
+    echo -e "${YELLOW}正在下载 Caddy...${PLAIN}"
     systemctl stop caddy 2>/dev/null
 
     DOWNLOAD_URL="${BASE_URL}/${FILE_NAME}"
     echo -e "下载地址: ${DOWNLOAD_URL}"
 
-    # 简单下载，避免复杂的参数导致报错
     wget --no-check-certificate -O /tmp/caddy_download "$DOWNLOAD_URL"
 
     if [[ ! -s "/tmp/caddy_download" ]]; then
-        echo -e "${RED}下载失败或文件为空！请检查网络或 URL。${PLAIN}"
+        echo -e "${RED}下载失败或文件为空！${PLAIN}"
         exit 1
     fi
 
@@ -69,76 +70,81 @@ download_caddy() {
     chmod +x /usr/bin/caddy
 
     if /usr/bin/caddy list-modules | grep -q "forward_proxy"; then
-        echo -e "${GREEN}Caddy 安装成功且 NaiveProxy 插件验证通过。${PLAIN}"
+        echo -e "${GREEN}Caddy 安装成功 (含 NaiveProxy 插件)。${PLAIN}"
     else
-        echo -e "${RED}错误：下载的 Caddy 文件不包含 forward_proxy 插件！${PLAIN}"
+        echo -e "${RED}错误：下载的文件不包含插件！${PLAIN}"
         exit 1
     fi
 }
 
-# 4. 证书申请 (完全复刻参考脚本逻辑)
+# 4. 证书申请 (完全复刻 install.sh 的 acmeInstallSSL 逻辑)
 check_and_issue_cert() {
     mkdir -p "$CERT_DIR"
     
     echo -e "${YELLOW}请输入您的域名:${PLAIN}"
     read -p "域名: " DOMAIN
     
-    CERT_FILE="$CERT_DIR/fullchain.pem"
-    KEY_FILE="$CERT_DIR/privkey.pem"
+    CERT_FILE="$CERT_DIR/${DOMAIN}.crt"
+    KEY_FILE="$CERT_DIR/${DOMAIN}.key"
     
-    NEED_ISSUE=1
+    # 安装 acme.sh (参考 install.sh 的 installTools)
+    if [[ ! -f "$ACME_SH_DIR/acme.sh" ]]; then
+        echo -e "${YELLOW}正在安装 acme.sh...${PLAIN}"
+        curl -s https://get.acme.sh | sh -s email=admin@${DOMAIN}
+        source ~/.bashrc 2>/dev/null
+    fi
     
-    # 检查现有证书是否有效
-    if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
-        if openssl x509 -checkend 2592000 -noout -in "$CERT_FILE" >/dev/null 2>&1; then
-            echo -e "${GREEN}检测到现有证书有效期充足，跳过申请步骤。${PLAIN}"
-            NEED_ISSUE=0
-        else
-            echo -e "${YELLOW}证书不存在或即将过期，准备申请...${PLAIN}"
-        fi
+    # 检查 acme.sh 是否安装成功
+    if [[ ! -f "$ACME_SH_DIR/acme.sh" ]]; then
+        echo -e "${RED}acme.sh 安装失败，请检查网络连接。${PLAIN}"
+        exit 1
     fi
 
-    if [[ "$NEED_ISSUE" -eq 1 ]]; then
-        # 安装 acme.sh
-        if [[ ! -f "$ACME_SH_DIR/acme.sh" ]]; then
-            curl https://get.acme.sh | sh -s email=admin@${DOMAIN}
-        fi
-        
-        echo -e "${YELLOW}请输入 Cloudflare API Token (仅需 DNS 编辑权限):${PLAIN}"
-        read -p "CF_Token: " CF_TOKEN
-        
-        if [[ -z "$CF_TOKEN" ]]; then
-            echo -e "${RED}错误: Token 不能为空。${PLAIN}"
-            exit 1
-        fi
-        
-        # 【关键】完全使用参考脚本的 Account ID 获取逻辑
-        export CF_Token="$CF_TOKEN"
-        
-        echo -e "${YELLOW}正在验证 Token...${PLAIN}"
-        CF_ACCOUNT_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
-             -H "Authorization: Bearer $CF_TOKEN" \
-             -H "Content-Type:application/json" | jq -r '.result.id' 2>/dev/null)
-        
-        if [[ -n "$CF_ACCOUNT_ID" && "$CF_ACCOUNT_ID" != "null" ]]; then
-             export CF_Account_ID="$CF_ACCOUNT_ID"
-        fi
+    # 获取 Cloudflare Token
+    echo -e "${YELLOW}请输入 Cloudflare API Token (参考 v2ray-agent 仅需 DNS 编辑权限):${PLAIN}"
+    read -p "CF_Token: " CF_TOKEN
+    
+    if [[ -z "$CF_TOKEN" ]]; then
+        echo -e "${RED}错误: Token 不能为空。${PLAIN}"
+        exit 1
+    fi
 
-        echo -e "${YELLOW}开始申请证书...${PLAIN}"
-        $ACME_SH_DIR/acme.sh --issue --server letsencrypt --dns dns_cf -d "$DOMAIN"
-        
-        if [[ $? -ne 0 ]]; then
-            echo -e "${RED}证书申请失败！请检查 Token 权限或域名解析。${PLAIN}"
-            exit 1
-        fi
+    echo -e "${YELLOW}开始申请证书 (ECC-256)...${PLAIN}"
+    
+    # =========================================================
+    # 核心复刻点：不进行API预检，直接通过环境变量传参给 acme.sh
+    # 对应 install.sh 中 acmeInstallSSL 函数的逻辑
+    # 强制使用 --server letsencrypt 和 -k ec-256 (ECC证书)
+    # =========================================================
+    
+    export CF_Token="$CF_TOKEN"
+    
+    # 申请证书
+    "$ACME_SH_DIR/acme.sh" --issue --server letsencrypt --dns dns_cf -d "$DOMAIN" -k ec-256
+    
+    local RET=$?
+    if [[ $RET -ne 0 ]]; then
+        echo -e "${RED}证书申请失败！错误代码: $RET${PLAIN}"
+        echo -e "${YELLOW}建议检查：${PLAIN}"
+        echo -e "1. Token 是否有 'Zone:DNS:Edit' 权限"
+        echo -e "2. 域名是否已托管在 Cloudflare"
+        exit 1
+    fi
 
-        # 安装证书到指定目录
-        $ACME_SH_DIR/acme.sh --install-cert -d "$DOMAIN" \
-            --key-file       "$KEY_FILE"  \
-            --fullchain-file "$CERT_FILE" \
-            --reloadcmd     "systemctl reload caddy"
-            
-        echo -e "${GREEN}证书申请并安装成功。${PLAIN}"
+    # 安装证书 (对应 install.sh 的 installTLS 函数)
+    # 注意：install.sh 使用了 --ecc 参数，我们也必须加上
+    "$ACME_SH_DIR/acme.sh" --install-cert -d "$DOMAIN" --ecc \
+        --fullchain-file "$CERT_FILE" \
+        --key-file       "$KEY_FILE" \
+        --reloadcmd      "systemctl reload caddy"
+        
+    if [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]]; then
+        echo -e "${GREEN}证书安装成功！${PLAIN}"
+        echo -e "Cert: $CERT_FILE"
+        echo -e "Key:  $KEY_FILE"
+    else
+        echo -e "${RED}证书文件未生成，请检查日志。${PLAIN}"
+        exit 1
     fi
 }
 
@@ -157,7 +163,7 @@ config_caddy() {
         echo "<h1>It works!</h1>" > /var/www/html/index.html
     fi
     
-    # 写入配置
+    # 注意：这里引用了上面生成的 .crt 和 .key 文件路径
     cat > $CADDY_DIR/Caddyfile <<EOF
 {
     admin off
@@ -166,7 +172,7 @@ config_caddy() {
 }
 
 :$PORT_MAIN, $DOMAIN:$PORT_MAIN {
-    tls $CERT_DIR/fullchain.pem $CERT_DIR/privkey.pem
+    tls $CERT_DIR/${DOMAIN}.crt $CERT_DIR/${DOMAIN}.key
     
     forward_proxy {
         basic_auth $NAIVE_USER $NAIVE_PASS
@@ -186,7 +192,6 @@ EOF
 setup_service_and_firewall() {
     echo -e "${YELLOW}配置端口转发与系统服务...${PLAIN}"
     
-    # iptables 配置 (参考脚本逻辑)
     if command -v iptables >/dev/null 2>&1; then
         iptables -t nat -D PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN 2>/dev/null
         iptables -t nat -A PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN
@@ -196,7 +201,6 @@ setup_service_and_firewall() {
         fi
     fi
 
-    # Systemd 服务
     cat > /etc/systemd/system/caddy.service <<EOF
 [Unit]
 Description=Caddy Web Server
