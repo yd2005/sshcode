@@ -1,8 +1,10 @@
 #!/bin/bash
 
 # ==============================================================
-# 脚本名称: caddy-naive-download.sh (API 修复版)
+# 脚本名称: caddy-naive-download.sh (完美复刻参考版逻辑)
 # 功能: Caddy+NaiveProxy 下载部署 & 证书管理
+# 架构: AMD64 / ARM64
+# 下载源: https://github.com/yd2005/Actions-P3TERX/releases/download/build-4/
 # ==============================================================
 
 # 颜色定义
@@ -14,7 +16,7 @@ PLAIN='\033[0m'
 # 下载源配置
 BASE_URL="https://github.com/yd2005/Actions-P3TERX/releases/download/build-4"
 
-# 路径配置
+# 路径与端口配置
 CADDY_DIR="/etc/caddy"
 CERT_DIR="/etc/naiveproxy/certs"
 ACME_SH_DIR="/root/.acme.sh"
@@ -37,20 +39,17 @@ check_system() {
         exit 1
     fi
     echo -e "${GREEN}系统架构检测通过: $ARCH${PLAIN}"
+    echo -e "${GREEN}即将下载文件: $FILE_NAME${PLAIN}"
 }
 
-# 2. 安装系统依赖
+# 2. 安装系统依赖 (参考脚本逻辑)
 install_dependencies() {
     echo -e "${YELLOW}正在安装系统依赖...${PLAIN}"
-    if [ -f /etc/debian_version ]; then
-        apt-get update -y
-        apt-get install -y curl wget tar socat jq openssl cron iptables-persistent netfilter-persistent libnss3-tools
-    elif [ -f /etc/redhat-release ]; then
-        yum install -y curl wget tar socat jq openssl cronie
-    fi
+    apt-get update -y
+    apt-get install -y curl wget git tar socat jq openssl cron iptables-persistent netfilter-persistent libnss3-tools
 }
 
-# 3. 下载 Caddy
+# 3. 下载 Caddy (替代编译)
 download_caddy() {
     echo -e "${YELLOW}正在从 GitHub 下载定制版 Caddy...${PLAIN}"
     systemctl stop caddy 2>/dev/null
@@ -58,7 +57,8 @@ download_caddy() {
     DOWNLOAD_URL="${BASE_URL}/${FILE_NAME}"
     echo -e "下载地址: ${DOWNLOAD_URL}"
 
-    wget --no-check-certificate -q --show-progress -O /tmp/caddy_download "$DOWNLOAD_URL"
+    # 简单下载，避免复杂的参数导致报错
+    wget --no-check-certificate -O /tmp/caddy_download "$DOWNLOAD_URL"
 
     if [[ ! -s "/tmp/caddy_download" ]]; then
         echo -e "${RED}下载失败或文件为空！请检查网络或 URL。${PLAIN}"
@@ -76,20 +76,19 @@ download_caddy() {
     fi
 }
 
-# 4. 证书申请 (API 预检增强版)
+# 4. 证书申请 (完全复刻参考脚本逻辑)
 check_and_issue_cert() {
     mkdir -p "$CERT_DIR"
     
-    echo -e "${YELLOW}==============================================${PLAIN}"
-    echo -e "${YELLOW}           证书配置 (Cloudflare API)          ${PLAIN}"
-    echo -e "${YELLOW}==============================================${PLAIN}"
-    echo -e "${YELLOW}请输入您的域名 (例如: example.com 或 sub.example.com):${PLAIN}"
+    echo -e "${YELLOW}请输入您的域名:${PLAIN}"
     read -p "域名: " DOMAIN
     
     CERT_FILE="$CERT_DIR/fullchain.pem"
     KEY_FILE="$CERT_DIR/privkey.pem"
+    
     NEED_ISSUE=1
     
+    # 检查现有证书是否有效
     if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
         if openssl x509 -checkend 2592000 -noout -in "$CERT_FILE" >/dev/null 2>&1; then
             echo -e "${GREEN}检测到现有证书有效期充足，跳过申请步骤。${PLAIN}"
@@ -100,11 +99,12 @@ check_and_issue_cert() {
     fi
 
     if [[ "$NEED_ISSUE" -eq 1 ]]; then
+        # 安装 acme.sh
         if [[ ! -f "$ACME_SH_DIR/acme.sh" ]]; then
             curl https://get.acme.sh | sh -s email=admin@${DOMAIN}
         fi
         
-        echo -e "${YELLOW}请输入 Cloudflare API Token (必须包含 Zone:Read 和 DNS:Edit 权限):${PLAIN}"
+        echo -e "${YELLOW}请输入 Cloudflare API Token (仅需 DNS 编辑权限):${PLAIN}"
         read -p "CF_Token: " CF_TOKEN
         
         if [[ -z "$CF_TOKEN" ]]; then
@@ -112,42 +112,31 @@ check_and_issue_cert() {
             exit 1
         fi
         
-        echo -e "${YELLOW}正在测试 Cloudflare API 连接...${PLAIN}"
-        
-        # 1. 验证 Token 有效性
-        VERIFY_RES=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
-             -H "Authorization: Bearer $CF_TOKEN" \
-             -H "Content-Type:application/json")
-        
-        TOKEN_STATUS=$(echo "$VERIFY_RES" | jq -r '.result.status')
-        
-        if [[ "$TOKEN_STATUS" != "active" ]]; then
-             echo -e "${RED}错误: Cloudflare Token 无效或未激活！请检查 Token 是否正确。${PLAIN}"
-             exit 1
-        fi
-        echo -e "${GREEN}Token 有效。正在获取 Account ID...${PLAIN}"
-
-        # 2. 尝试提取 Account ID (acme.sh 需要)
-        # 即使这里获取失败，只要 Token 权限够，acme.sh 也能自己跑，但预检更稳
+        # 【关键】完全使用参考脚本的 Account ID 获取逻辑
         export CF_Token="$CF_TOKEN"
-        # 尝试通过 verify 接口获取 ID (某些 Token 类型不返回 ID，不强求)
-        # acme.sh 内部会自动处理 Account ID，关键是 Zone ID 的获取权限
+        
+        echo -e "${YELLOW}正在验证 Token...${PLAIN}"
+        CF_ACCOUNT_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+             -H "Authorization: Bearer $CF_TOKEN" \
+             -H "Content-Type:application/json" | jq -r '.result.id' 2>/dev/null)
+        
+        if [[ -n "$CF_ACCOUNT_ID" && "$CF_ACCOUNT_ID" != "null" ]]; then
+             export CF_Account_ID="$CF_ACCOUNT_ID"
+        fi
 
         echo -e "${YELLOW}开始申请证书...${PLAIN}"
-        # 使用 --debug 2 参数以便出错时看到详细信息
         $ACME_SH_DIR/acme.sh --issue --server letsencrypt --dns dns_cf -d "$DOMAIN"
         
         if [[ $? -ne 0 ]]; then
-            echo -e "${RED}==========================================================${PLAIN}"
-            echo -e "${RED} 证书申请失败！${PLAIN}"
-            echo -e "${RED} 常见原因：${PLAIN}"
-            echo -e "${RED} 1. Token 缺少 'Zone:Read' 权限 (导致 invalid domain 错误)。${PLAIN}"
-            echo -e "${RED} 2. 域名填写错误，Cloudflare 账号下没有该域名。${PLAIN}"
-            echo -e "${RED}==========================================================${PLAIN}"
+            echo -e "${RED}证书申请失败！请检查 Token 权限或域名解析。${PLAIN}"
             exit 1
         fi
 
-        $ACME_SH_DIR/acme.sh --install-cert -d "$DOMAIN" --key-file "$KEY_FILE" --fullchain-file "$CERT_FILE" --reloadcmd "systemctl reload caddy"
+        # 安装证书到指定目录
+        $ACME_SH_DIR/acme.sh --install-cert -d "$DOMAIN" \
+            --key-file       "$KEY_FILE"  \
+            --fullchain-file "$CERT_FILE" \
+            --reloadcmd     "systemctl reload caddy"
             
         echo -e "${GREEN}证书申请并安装成功。${PLAIN}"
     fi
@@ -155,10 +144,7 @@ check_and_issue_cert() {
 
 # 5. 配置 Caddy
 config_caddy() {
-    echo -e "${YELLOW}==============================================${PLAIN}"
-    echo -e "${YELLOW}              NaiveProxy 用户配置             ${PLAIN}"
-    echo -e "${YELLOW}==============================================${PLAIN}"
-    
+    echo -e "${YELLOW}正在生成配置文件...${PLAIN}"
     read -p "设置 NaiveProxy 用户名 [默认: admin]: " NAIVE_USER
     [[ -z "$NAIVE_USER" ]] && NAIVE_USER="admin"
     read -p "设置 NaiveProxy 密码 [默认: admin]: " NAIVE_PASS
@@ -171,7 +157,7 @@ config_caddy() {
         echo "<h1>It works!</h1>" > /var/www/html/index.html
     fi
     
-    echo -e "${YELLOW}正在生成配置文件...${PLAIN}"
+    # 写入配置
     cat > $CADDY_DIR/Caddyfile <<EOF
 {
     admin off
@@ -200,6 +186,7 @@ EOF
 setup_service_and_firewall() {
     echo -e "${YELLOW}配置端口转发与系统服务...${PLAIN}"
     
+    # iptables 配置 (参考脚本逻辑)
     if command -v iptables >/dev/null 2>&1; then
         iptables -t nat -D PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN 2>/dev/null
         iptables -t nat -A PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN
@@ -209,6 +196,7 @@ setup_service_and_firewall() {
         fi
     fi
 
+    # Systemd 服务
     cat > /etc/systemd/system/caddy.service <<EOF
 [Unit]
 Description=Caddy Web Server
