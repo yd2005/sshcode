@@ -1,180 +1,139 @@
-#!/bin/sh
+#!/bin/bash
 
-# ================= 配置区域 =================
-# 【关键】请修改下面的链接！
-# 填入 GitHub Release 的"目录"链接（不包含具体文件名）
-# 例如你的某个文件链接是: https://github.com/abc/repo/releases/download/build-1/caddy-linux-arm64-upx
-# 那么请只填入到 "build-1" 为止，如下所示：
-BASE_URL="https://github.com/yd2005/Actions-P3TERX/releases/download/build-4/"
-# ===========================================
+# ==============================================================
+# 脚本名称: caddy-naive-download.sh
+# 功能: Caddy+NaiveProxy 下载部署 (免编译) & 证书管理
+# 架构: AMD64 / ARM64
+# 源地址: https://github.com/yd2005/Actions-P3TERX/releases/download/build-4/
+# ==============================================================
 
-# 检查 root 权限
-if [ "$(id -u)" -ne 0 ]; then
-    echo "❌ 错误：请以 root 权限运行此脚本"
-    exit 1
-fi
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+PLAIN='\033[0m'
 
-echo "=== Caddy NaiveProxy 通用安装脚本 ==="
-echo "=== 适配：VPS (AMD/ARM) & OpenWrt (AX6/AX6000) ==="
+# 下载源配置
+BASE_URL="https://github.com/yd2005/Actions-P3TERX/releases/download/build-4"
 
-# 1. 环境检测
-ARCH=$(uname -m)
-IS_OPENWRT=0
-if [ -f /etc/openwrt_release ]; then
-    IS_OPENWRT=1
-    echo ">>> 检测到系统环境：OpenWrt / ImmortalWrt (路由器)"
-else
-    echo ">>> 检测到系统环境：常规 Linux (VPS)"
-fi
+# 路径与端口配置
+CADDY_DIR="/etc/caddy"
+CERT_DIR="/etc/naiveproxy/certs"
+ACME_SH_DIR="/root/.acme.sh"
+PORT_MAIN=8443
+PORT_RANGE_START=3600
+PORT_RANGE_END=3610
 
-# 2. 确定目标文件名
-TARGET_FILE=""
+# 检查 Root 权限
+[[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 用户运行此脚本。${PLAIN}" && exit 1
 
-if [ "$ARCH" = "x86_64" ]; then
-    echo ">>> 架构检测：AMD64 (x86_64)"
-    TARGET_FILE="caddy-linux-amd64"
-    if [ "$IS_OPENWRT" -eq 1 ]; then
-       echo "❌ 暂不支持 x86 架构的 OpenWrt 自动脚本，建议手动安装。"
-       exit 1
-    fi
-elif [ "$ARCH" = "aarch64" ]; then
-    echo ">>> 架构检测：ARM64 (aarch64)"
-    if [ "$IS_OPENWRT" -eq 1 ]; then
-        # 路由器使用 UPX 压缩版
-        TARGET_FILE="caddy-linux-arm64-upx"
-        echo ">>> 策略：路由器环境，将下载 UPX 压缩版 (节省空间)"
+# 1. 系统架构检测
+check_system() {
+    ARCH=$(uname -m)
+    if [[ "$ARCH" == "x86_64" ]]; then
+        FILE_NAME="caddy-linux-amd64"
+    elif [[ "$ARCH" == "aarch64" ]]; then
+        # 注意：这里使用未压缩版本以保证 VPS 性能，如果需要极致空间可改为 caddy-linux-arm64-upx
+        FILE_NAME="caddy-linux-arm64"
     else
-        # VPS 使用普通版
-        TARGET_FILE="caddy-linux-arm64"
-        echo ">>> 策略：VPS 环境，将下载标准 ARM64 版"
+        echo -e "${RED}不支持的系统架构: $ARCH${PLAIN}"
+        exit 1
     fi
-else
-    echo "❌ 不支持的架构：$ARCH"
-    exit 1
-fi
-
-DOWNLOAD_URL="${BASE_URL}/${TARGET_FILE}"
-echo ">>> 准备下载：$DOWNLOAD_URL"
-
-# 3. 下载文件
-# 停止现有服务
-if [ "$IS_OPENWRT" -eq 1 ]; then
-    /etc/init.d/caddy stop 2>/dev/null
-else
-    systemctl stop caddy 2>/dev/null
-fi
-
-echo ">>> 正在下载..."
-# OpenWrt 可能没有 curl，优先使用 wget，且不检查证书(防止老旧系统根证书缺失)
-wget --no-check-certificate -O /tmp/caddy_new "$DOWNLOAD_URL"
-
-if [ ! -s "/tmp/caddy_new" ]; then
-    echo "❌ 下载失败或文件为空！请检查 BASE_URL 是否正确。"
-    echo "尝试访问链接: $DOWNLOAD_URL"
-    exit 1
-fi
-
-# 4. 安装文件
-echo ">>> 安装二进制文件..."
-mv /tmp/caddy_new /usr/bin/caddy
-chmod +x /usr/bin/caddy
-
-# 验证
-if ! /usr/bin/caddy version >/dev/null 2>&1; then
-    echo "❌ 错误：下载的文件无法运行！可能架构不匹配或文件损坏。"
-    exit 1
-fi
-echo "✅ 二进制文件安装成功！"
-
-# 5. 配置服务 (分流处理)
-if [ "$IS_OPENWRT" -eq 1 ]; then
-    # ================= OpenWrt 配置 =================
-    echo ">>> 配置 OpenWrt Procd 服务..."
-    
-    # 创建 Caddyfile (如果不存在)
-    if [ ! -f /etc/caddy/Caddyfile ]; then
-        mkdir -p /etc/caddy
-        echo "# Caddyfile for OpenWrt" > /etc/caddy/Caddyfile
-        echo ":80 {" >> /etc/caddy/Caddyfile
-        echo "    respond \"Hello OpenWrt\"" >> /etc/caddy/Caddyfile
-        echo "}" >> /etc/caddy/Caddyfile
-        echo ">>> 已创建默认配置 /etc/caddy/Caddyfile"
-    fi
-
-    # 创建启动脚本
-    cat > /etc/init.d/caddy <<EOF
-#!/bin/sh /etc/rc.common
-
-START=99
-USE_PROCD=1
-
-start_service() {
-    procd_open_instance
-    # 路由器通常直接使用 root 运行，避免权限问题
-    procd_set_param command /usr/bin/caddy run --environ --config /etc/caddy/Caddyfile --adapter caddyfile
-    procd_set_param limits core="unlimited"
-    procd_set_param respawn
-    procd_set_param stdout 1
-    procd_set_param stderr 1
-    procd_close_instance
+    echo -e "${GREEN}系统架构检测通过: $ARCH${PLAIN}"
+    echo -e "${GREEN}即将下载文件: $FILE_NAME${PLAIN}"
 }
-EOF
-    chmod +x /etc/init.d/caddy
-    /etc/init.d/caddy enable
-    /etc/init.d/caddy restart
-    echo "=== OpenWrt 部署完成 ==="
-    echo "请编辑 /etc/caddy/Caddyfile 后运行: /etc/init.d/caddy restart"
 
-else
-    # ================= VPS (Systemd) 配置 =================
-    echo ">>> 配置 Systemd 服务..."
-    
-    # 基础工具
+# 2. 安装系统依赖
+install_dependencies() {
+    echo -e "${YELLOW}正在安装系统依赖...${PLAIN}"
+    # 更新软件源并安装基础工具
     if [ -f /etc/debian_version ]; then
-        apt-get update -y && apt-get install -y libnss3-tools
+        apt-get update -y
+        apt-get install -y curl wget tar socat jq openssl cron iptables-persistent netfilter-persistent libnss3-tools
+    elif [ -f /etc/redhat-release ]; then
+        yum install -y curl wget tar socat jq openssl cronie
+    else
+        echo -e "${RED}未知的操作系统，脚本仅支持 Debian/Ubuntu/CentOS${PLAIN}"
+        exit 1
     fi
+}
 
-    # 用户配置
-    groupadd --system caddy 2>/dev/null
-    useradd --system --gid caddy --create-home --home-dir /var/lib/caddy --shell /usr/sbin/nologin caddy 2>/dev/null
-    mkdir -p /etc/caddy
-    chown -R caddy:caddy /etc/caddy
-
-    # 创建默认配置
-    if [ ! -f /etc/caddy/Caddyfile ]; then
-        touch /etc/caddy/Caddyfile
-        echo "# Caddyfile for VPS" > /etc/caddy/Caddyfile
-    fi
-
-    # Systemd 文件
-    cat > /etc/systemd/system/caddy.service <<EOF
-[Unit]
-Description=Caddy
-Documentation=https://caddyserver.com/docs/
-After=network.target network-online.target
-Requires=network-online.target
-
-[Service]
-Type=notify
-User=caddy
-Group=caddy
-ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
-ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile
-TimeoutStopSec=5s
-LimitNOFILE=1048576
-LimitNPROC=512
-PrivateTmp=true
-ProtectSystem=full
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable caddy
-    systemctl restart caddy
+# 3. 下载 Caddy (替代原有的编译步骤)
+download_caddy() {
+    echo -e "${YELLOW}正在从 GitHub 下载定制版 Caddy...${PLAIN}"
     
-    echo "=== VPS 部署完成 ==="
-    systemctl status caddy --no-pager
-fi
+    # 停止现有服务
+    systemctl stop caddy 2>/dev/null
+
+    DOWNLOAD_URL="${BASE_URL}/${FILE_NAME}"
+    echo -e "下载地址: ${DOWNLOAD_URL}"
+
+    # 下载到临时目录
+    wget --no-check-certificate -q --show-progress -O /tmp/caddy_download "$DOWNLOAD_URL"
+
+    # 验证下载
+    if [[ ! -s "/tmp/caddy_download" ]]; then
+        echo -e "${RED}下载失败或文件为空！请检查网络或 URL。${PLAIN}"
+        exit 1
+    fi
+
+    # 安装
+    mv /tmp/caddy_download /usr/bin/caddy
+    chmod +x /usr/bin/caddy
+
+    # 验证版本与插件
+    if /usr/bin/caddy list-modules | grep -q "forward_proxy"; then
+        echo -e "${GREEN}Caddy 安装成功且 NaiveProxy 插件验证通过。${PLAIN}"
+    else
+        echo -e "${RED}错误：下载的 Caddy 文件不包含 forward_proxy 插件！${PLAIN}"
+        exit 1
+    fi
+}
+
+# 4. 证书申请 (Acme.sh + Cloudflare DNS)
+check_and_issue_cert() {
+    mkdir -p "$CERT_DIR"
+    
+    echo -e "${YELLOW}==============================================${PLAIN}"
+    echo -e "${YELLOW}           证书配置 (Cloudflare API)          ${PLAIN}"
+    echo -e "${YELLOW}==============================================${PLAIN}"
+    echo -e "${YELLOW}请输入您的域名:${PLAIN}"
+    read -p "域名: " DOMAIN
+    
+    CERT_FILE="$CERT_DIR/fullchain.pem"
+    KEY_FILE="$CERT_DIR/privkey.pem"
+    
+    NEED_ISSUE=1
+    
+    # 检查现有证书是否有效 (剩余有效期 > 30天)
+    if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
+        if openssl x509 -checkend 2592000 -noout -in "$CERT_FILE" >/dev/null 2>&1; then
+            echo -e "${GREEN}检测到现有证书有效期充足，跳过申请步骤。${PLAIN}"
+            NEED_ISSUE=0
+        else
+            echo -e "${YELLOW}证书不存在或即将过期，准备申请...${PLAIN}"
+        fi
+    fi
+
+    if [[ "$NEED_ISSUE" -eq 1 ]]; then
+        # 安装 acme.sh
+        if [[ ! -f "$ACME_SH_DIR/acme.sh" ]]; then
+            curl https://get.acme.sh | sh -s email=admin@${DOMAIN}
+        fi
+        
+        echo -e "${YELLOW}请输入 Cloudflare API Token (仅需 DNS 编辑权限):${PLAIN}"
+        read -p "CF_Token: " CF_TOKEN
+        
+        if [[ -z "$CF_TOKEN" ]]; then
+            echo -e "${RED}错误: Token 不能为空。${PLAIN}"
+            exit 1
+        fi
+        
+        # 设置环境变量
+        export CF_Token="$CF_TOKEN"
+        
+        # 尝试验证 Token
+        echo -e "${YELLOW}正在验证 Token...${PLAIN}"
+        CF_ACCOUNT_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+             -H "Authorization: Bearer $CF_TOKEN" \
+             -H "Content-Type:application
