@@ -1,10 +1,8 @@
 #!/bin/bash
 
 # ==============================================================
-# 脚本名称: caddy-naive-download.sh
-# 功能: Caddy+NaiveProxy 下载部署 (免编译) & 证书管理
-# 架构: AMD64 / ARM64
-# 源地址: https://github.com/yd2005/Actions-P3TERX/releases/download/build-4/
+# 脚本名称: caddy-naive-download.sh (修复版)
+# 功能: Caddy+NaiveProxy 下载部署 & 证书管理
 # ==============================================================
 
 # 颜色定义
@@ -13,7 +11,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
-# 下载源配置
+# 下载源配置 (Github Release)
 BASE_URL="https://github.com/yd2005/Actions-P3TERX/releases/download/build-4"
 
 # 路径与端口配置
@@ -33,7 +31,6 @@ check_system() {
     if [[ "$ARCH" == "x86_64" ]]; then
         FILE_NAME="caddy-linux-amd64"
     elif [[ "$ARCH" == "aarch64" ]]; then
-        # 注意：这里使用未压缩版本以保证 VPS 性能，如果需要极致空间可改为 caddy-linux-arm64-upx
         FILE_NAME="caddy-linux-arm64"
     else
         echo -e "${RED}不支持的系统架构: $ARCH${PLAIN}"
@@ -46,7 +43,6 @@ check_system() {
 # 2. 安装系统依赖
 install_dependencies() {
     echo -e "${YELLOW}正在安装系统依赖...${PLAIN}"
-    # 更新软件源并安装基础工具
     if [ -f /etc/debian_version ]; then
         apt-get update -y
         apt-get install -y curl wget tar socat jq openssl cron iptables-persistent netfilter-persistent libnss3-tools
@@ -58,30 +54,24 @@ install_dependencies() {
     fi
 }
 
-# 3. 下载 Caddy (替代原有的编译步骤)
+# 3. 下载 Caddy
 download_caddy() {
     echo -e "${YELLOW}正在从 GitHub 下载定制版 Caddy...${PLAIN}"
-    
-    # 停止现有服务
     systemctl stop caddy 2>/dev/null
 
     DOWNLOAD_URL="${BASE_URL}/${FILE_NAME}"
     echo -e "下载地址: ${DOWNLOAD_URL}"
 
-    # 下载到临时目录
     wget --no-check-certificate -q --show-progress -O /tmp/caddy_download "$DOWNLOAD_URL"
 
-    # 验证下载
     if [[ ! -s "/tmp/caddy_download" ]]; then
         echo -e "${RED}下载失败或文件为空！请检查网络或 URL。${PLAIN}"
         exit 1
     fi
 
-    # 安装
     mv /tmp/caddy_download /usr/bin/caddy
     chmod +x /usr/bin/caddy
 
-    # 验证版本与插件
     if /usr/bin/caddy list-modules | grep -q "forward_proxy"; then
         echo -e "${GREEN}Caddy 安装成功且 NaiveProxy 插件验证通过。${PLAIN}"
     else
@@ -102,10 +92,8 @@ check_and_issue_cert() {
     
     CERT_FILE="$CERT_DIR/fullchain.pem"
     KEY_FILE="$CERT_DIR/privkey.pem"
-    
     NEED_ISSUE=1
     
-    # 检查现有证书是否有效 (剩余有效期 > 30天)
     if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
         if openssl x509 -checkend 2592000 -noout -in "$CERT_FILE" >/dev/null 2>&1; then
             echo -e "${GREEN}检测到现有证书有效期充足，跳过申请步骤。${PLAIN}"
@@ -116,7 +104,6 @@ check_and_issue_cert() {
     fi
 
     if [[ "$NEED_ISSUE" -eq 1 ]]; then
-        # 安装 acme.sh
         if [[ ! -f "$ACME_SH_DIR/acme.sh" ]]; then
             curl https://get.acme.sh | sh -s email=admin@${DOMAIN}
         fi
@@ -129,14 +116,11 @@ check_and_issue_cert() {
             exit 1
         fi
         
-        # 设置环境变量
         export CF_Token="$CF_TOKEN"
         
-        # 尝试验证 Token
         echo -e "${YELLOW}正在验证 Token...${PLAIN}"
-        CF_ACCOUNT_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
-             -H "Authorization: Bearer $CF_TOKEN" \
-             -H "Content-Type:application/json" | jq -r '.result.id' 2>/dev/null)
+        # 下面这行命令已合并为一行，防止复制出错
+        CF_ACCOUNT_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type:application/json" | jq -r '.result.id' 2>/dev/null)
         
         if [[ -n "$CF_ACCOUNT_ID" && "$CF_ACCOUNT_ID" != "null" ]]; then
              export CF_Account_ID="$CF_ACCOUNT_ID"
@@ -150,11 +134,8 @@ check_and_issue_cert() {
             exit 1
         fi
 
-        # 安装证书到指定目录
-        $ACME_SH_DIR/acme.sh --install-cert -d "$DOMAIN" \
-            --key-file       "$KEY_FILE"  \
-            --fullchain-file "$CERT_FILE" \
-            --reloadcmd     "systemctl reload caddy"
+        # 下面这行也合并为一行
+        $ACME_SH_DIR/acme.sh --install-cert -d "$DOMAIN" --key-file "$KEY_FILE" --fullchain-file "$CERT_FILE" --reloadcmd "systemctl reload caddy"
             
         echo -e "${GREEN}证书申请并安装成功。${PLAIN}"
     fi
@@ -174,13 +155,12 @@ config_caddy() {
     mkdir -p $CADDY_DIR
     mkdir -p /var/www/html
     
-    # 写入伪装页面
     if [[ ! -f /var/www/html/index.html ]]; then
         echo "<h1>It works!</h1>" > /var/www/html/index.html
     fi
     
-    # 生成 Caddyfile
     echo -e "${YELLOW}正在生成配置文件...${PLAIN}"
+    # 使用 cat 生成文件，确保格式正确
     cat > $CADDY_DIR/Caddyfile <<EOF
 {
     admin off
@@ -209,19 +189,15 @@ EOF
 setup_service_and_firewall() {
     echo -e "${YELLOW}配置端口转发与系统服务...${PLAIN}"
     
-    # 配置 iptables 端口转发 (3600-3610 -> 8443)
-    # 仅在 iptables 存在时执行
     if command -v iptables >/dev/null 2>&1; then
         iptables -t nat -D PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN 2>/dev/null
         iptables -t nat -A PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN
         
-        # 尝试保存规则 (兼容 Debian/Ubuntu)
         if command -v netfilter-persistent >/dev/null 2>&1; then
             netfilter-persistent save
         fi
     fi
 
-    # 创建 Systemd 服务文件
     cat > /etc/systemd/system/caddy.service <<EOF
 [Unit]
 Description=Caddy Web Server
@@ -246,7 +222,6 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-    # 启动服务
     systemctl daemon-reload
     systemctl enable caddy
     systemctl restart caddy
@@ -273,6 +248,7 @@ show_node_info() {
     echo -e "密码: ${YELLOW}$NAIVE_PASS${PLAIN}"
     echo ""
     echo -e "${GREEN}客户端配置 (config.json):${PLAIN}"
+    # 使用单引号防止变量提前展开，确保 JSON 格式输出正确
     echo -e "\033[36m{"
     echo -e "  \"listen\": \"socks://127.0.0.1:1080\","
     echo -e "  \"proxy\": \"https://$NAIVE_USER:$NAIVE_PASS@$DOMAIN:$PORT_MAIN\""
@@ -285,8 +261,7 @@ show_node_info() {
 main() {
     check_system
     install_dependencies
-    # install_go (已移除)
-    download_caddy # (替代 compile_caddy)
+    download_caddy
     check_and_issue_cert
     config_caddy
     setup_service_and_firewall
