@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==============================================================
-# 脚本名称: caddy-smart-install.sh
-# 功能: 智能BBR检测 + 证书有效性预检 + 泛域名自动推导 + Caddy部署
+# 脚本名称: caddy-final.sh
+# 功能: 智能容错证书申请 + 泛域名自动推导 + BBR/内核优化
 # 架构: AMD64 / ARM64
 # ==============================================================
 
@@ -30,24 +30,16 @@ PORT_RANGE_END=3610
 optimize_system() {
     echo -e "${YELLOW}正在检查系统内核状态...${PLAIN}"
     
-    CURRENT_ALGO=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    if [[ "$CURRENT_ALGO" == "bbr" ]]; then
-        echo -e "${GREEN}检测到 BBR 已在运行中，跳过重复优化。${PLAIN}"
+    # 简单检查 BBR 是否开启
+    if sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
+        echo -e "${GREEN}BBR 已开启，跳过优化。${PLAIN}"
         return
     fi
 
-    if grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
-        echo -e "${GREEN}检测到 sysctl.conf 已包含 BBR 配置，尝试重新加载...${PLAIN}"
-        sysctl -p >/dev/null 2>&1
-        return
-    fi
-
-    echo -e "${YELLOW}未检测到优化配置，正在应用内核优化 (参考 v2ray-agent)...${PLAIN}"
-    
+    echo -e "${YELLOW}正在应用内核优化 (参考 v2ray-agent)...${PLAIN}"
     cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%F)
+    
     cat >> /etc/sysctl.conf <<EOF
-
-# Caddy-Naive-Optimized
 fs.file-max = 1000000
 fs.inotify.max_user_instances = 8192
 net.ipv4.tcp_syncookies = 1
@@ -76,7 +68,6 @@ EOF
         echo "ulimit -SHn 65535" >> /etc/profile
         ulimit -SHn 65535
     fi
-    echo -e "${GREEN}内核参数优化已完成。${PLAIN}"
 }
 
 # 2. 系统架构检测
@@ -121,14 +112,14 @@ download_caddy() {
     chmod +x /usr/bin/caddy
 
     if /usr/bin/caddy list-modules | grep -q "forward_proxy"; then
-        echo -e "${GREEN}Caddy 验证通过 (含 NaiveProxy 插件)。${PLAIN}"
+        echo -e "${GREEN}Caddy 验证通过。${PLAIN}"
     else
         echo -e "${RED}错误：下载的文件不包含插件！${PLAIN}"
         exit 1
     fi
 }
 
-# 5. 证书申请 (含有效性检查)
+# 5. 证书申请 (容错版)
 check_and_issue_cert() {
     mkdir -p "$CERT_DIR"
     
@@ -136,7 +127,6 @@ check_and_issue_cert() {
     echo -e "${YELLOW}   泛域名证书申请 (Wildcard Certificate)         ${PLAIN}"
     echo -e "${YELLOW}=================================================${PLAIN}"
     echo -e "${YELLOW}请输入具体的节点域名 (例如: vps.google.com)${PLAIN}"
-    echo -e "${YELLOW}脚本将自动提取 google.com 并申请/复用 *.google.com${PLAIN}"
     read -p "具体域名: " INPUT_DOMAIN
     
     if [[ -z "$INPUT_DOMAIN" ]]; then
@@ -152,35 +142,27 @@ check_and_issue_cert() {
     fi
 
     WILDCARD_DOMAIN="*.${ROOT_DOMAIN}"
-    echo -e "${GREEN}识别主域名: ${ROOT_DOMAIN}${PLAIN}"
     echo -e "${GREEN}目标泛域名: ${WILDCARD_DOMAIN}${PLAIN}"
 
     CERT_FILE="$CERT_DIR/wildcard.${ROOT_DOMAIN}.crt"
     KEY_FILE="$CERT_DIR/wildcard.${ROOT_DOMAIN}.key"
     
-    # ================= 关键修改：证书有效性检查 =================
+    # 安装 acme.sh
+    if [[ ! -f "$ACME_SH_DIR/acme.sh" ]]; then
+        curl -s https://get.acme.sh | sh -s email=admin@${ROOT_DOMAIN}
+        source ~/.bashrc 2>/dev/null
+    fi
+
+    # 预检证书有效性 (目标目录)
     NEED_ISSUE=1
     if [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]]; then
-        # 检查证书是否在 30 天内过期 (2592000秒)
-        # 如果返回 0，表示证书在未来 30 天内依然有效，无需重新申请
         if openssl x509 -checkend 2592000 -noout -in "$CERT_FILE" >/dev/null 2>&1; then
-            echo -e "${GREEN}检测到有效的泛域名证书 (有效期 > 30天)，跳过申请步骤。${PLAIN}"
+            echo -e "${GREEN}检测到目标目录已有有效证书，完全跳过申请。${PLAIN}"
             NEED_ISSUE=0
-        else
-            echo -e "${YELLOW}现有证书不存在或即将过期，准备申请...${PLAIN}"
         fi
     fi
 
-    # 只有需要申请时才执行后续步骤
     if [[ "$NEED_ISSUE" -eq 1 ]]; then
-        # 安装 acme.sh
-        if [[ ! -f "$ACME_SH_DIR/acme.sh" ]]; then
-            curl -s https://get.acme.sh | sh -s email=admin@${ROOT_DOMAIN}
-            source ~/.bashrc 2>/dev/null
-        fi
-
         echo -e "${YELLOW}请输入 Cloudflare API Token:${PLAIN}"
         read -p "CF_Token: " CF_TOKEN
-        [[ -z "$CF_TOKEN" ]] && echo -e "${RED}Token为空${PLAIN}" && exit 1
-
-        # 强制默认 CA 为 Let's Enc
+        [[ -z "$CF_TOKEN" ]] && echo -e "${RED}Token为空${
