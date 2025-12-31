@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # ==============================================================
-# 脚本名称: caddy-naive-download.sh (Let's Encrypt 强制版)
-# 功能: Caddy+NaiveProxy 下载部署 & 强制 Let's Encrypt 证书
+# 脚本名称: caddy-smart-install.sh
+# 功能: 智能BBR检测 + 泛域名证书自动推导 + Caddy部署
+# 架构: AMD64 / ARM64
 # ==============================================================
 
 # 颜色定义
@@ -25,7 +26,68 @@ PORT_RANGE_END=3610
 # 检查 Root 权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 用户运行此脚本。${PLAIN}" && exit 1
 
-# 1. 系统架构检测
+# 1. 智能内核优化 (先检查，后修改)
+optimize_system() {
+    echo -e "${YELLOW}正在检查系统内核状态...${PLAIN}"
+    
+    # 检查 BBR 运行状态
+    CURRENT_ALGO=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [[ "$CURRENT_ALGO" == "bbr" ]]; then
+        echo -e "${GREEN}检测到 BBR 已在运行中，跳过重复优化。${PLAIN}"
+        return
+    fi
+
+    # 检查配置文件是否已修改过
+    if grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
+        echo -e "${GREEN}检测到 sysctl.conf 已包含 BBR 配置，尝试重新加载...${PLAIN}"
+        sysctl -p >/dev/null 2>&1
+        return
+    fi
+
+    echo -e "${YELLOW}未检测到优化配置，正在应用内核优化 (参考 v2ray-agent)...${PLAIN}"
+    
+    # 备份原配置
+    cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%F)
+
+    # 写入优化参数
+    cat >> /etc/sysctl.conf <<EOF
+
+# Caddy-Naive-Optimized
+fs.file-max = 1000000
+fs.inotify.max_user_instances = 8192
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 1024 65000
+net.ipv4.tcp_max_syn_backlog = 16384
+net.ipv4.tcp_max_tw_buckets = 6000
+net.ipv4.route.gc_timeout = 100
+net.ipv4.tcp_syn_retries = 1
+net.ipv4.tcp_synack_retries = 1
+net.core.somaxconn = 32768
+net.core.netdev_max_backlog = 32768
+net.ipv4.tcp_timestamps = 0
+net.ipv4.tcp_max_orphans = 32768
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+
+    # 应用参数
+    sysctl -p >/dev/null 2>&1
+    echo -e "${GREEN}内核参数优化已完成，BBR 已开启。${PLAIN}"
+
+    # 调整 ulimit
+    if ! grep -q "ulimit -SHn 65535" /etc/profile; then
+        echo "ulimit -SHn 65535" >> /etc/profile
+        ulimit -SHn 65535
+    fi
+}
+
+# 2. 系统架构检测
 check_system() {
     ARCH=$(uname -m)
     if [[ "$ARCH" == "x86_64" ]]; then
@@ -36,10 +98,9 @@ check_system() {
         echo -e "${RED}不支持的系统架构: $ARCH${PLAIN}"
         exit 1
     fi
-    echo -e "${GREEN}系统架构检测通过: $ARCH${PLAIN}"
 }
 
-# 2. 安装系统依赖 (复刻 install.sh 的依赖列表)
+# 3. 安装依赖
 install_dependencies() {
     echo -e "${YELLOW}正在安装系统依赖...${PLAIN}"
     if [ -f /etc/debian_version ]; then
@@ -50,18 +111,17 @@ install_dependencies() {
     fi
 }
 
-# 3. 下载 Caddy
+# 4. 下载 Caddy
 download_caddy() {
     echo -e "${YELLOW}正在下载 Caddy...${PLAIN}"
     systemctl stop caddy 2>/dev/null
-
+    
     DOWNLOAD_URL="${BASE_URL}/${FILE_NAME}"
     echo -e "下载地址: ${DOWNLOAD_URL}"
-
-    wget --no-check-certificate -O /tmp/caddy_download "$DOWNLOAD_URL"
-
+    
+    wget --no-check-certificate -q --show-progress -O /tmp/caddy_download "$DOWNLOAD_URL"
     if [[ ! -s "/tmp/caddy_download" ]]; then
-        echo -e "${RED}下载失败或文件为空！${PLAIN}"
+        echo -e "${RED}下载失败！${PLAIN}"
         exit 1
     fi
 
@@ -69,81 +129,83 @@ download_caddy() {
     chmod +x /usr/bin/caddy
 
     if /usr/bin/caddy list-modules | grep -q "forward_proxy"; then
-        echo -e "${GREEN}Caddy 安装成功 (含 NaiveProxy 插件)。${PLAIN}"
+        echo -e "${GREEN}Caddy 验证通过 (含 NaiveProxy 插件)。${PLAIN}"
     else
         echo -e "${RED}错误：下载的文件不包含插件！${PLAIN}"
         exit 1
     fi
 }
 
-# 4. 证书申请 (强制 Let's Encrypt + ECC)
+# 5. 证书申请 (输入子域名 -> 提取主域名 -> 申请泛域名)
 check_and_issue_cert() {
     mkdir -p "$CERT_DIR"
     
-    echo -e "${YELLOW}请输入您的域名:${PLAIN}"
-    read -p "域名: " DOMAIN
+    echo -e "${YELLOW}=================================================${PLAIN}"
+    echo -e "${YELLOW}   泛域名证书申请 (Wildcard Certificate)         ${PLAIN}"
+    echo -e "${YELLOW}=================================================${PLAIN}"
+    echo -e "${YELLOW}请输入具体的节点域名 (例如: vps.google.com)${PLAIN}"
+    echo -e "${YELLOW}脚本将自动提取 google.com 并申请 *.google.com${PLAIN}"
+    read -p "具体域名: " INPUT_DOMAIN
     
-    CERT_FILE="$CERT_DIR/${DOMAIN}.crt"
-    KEY_FILE="$CERT_DIR/${DOMAIN}.key"
+    if [[ -z "$INPUT_DOMAIN" ]]; then
+        echo -e "${RED}域名不能为空！${PLAIN}"
+        exit 1
+    fi
+
+    # 核心逻辑：从 input.domain.com 提取 domain.com
+    # 使用 Shell 参数扩展，删除第一个点及其左边的内容
+    ROOT_DOMAIN="${INPUT_DOMAIN#*.}"
     
+    if [[ "$ROOT_DOMAIN" == "$INPUT_DOMAIN" ]]; then
+         echo -e "${RED}错误：请输入二级或多级域名 (例如 abc.example.com)，不要直接输入 example.com${PLAIN}"
+         exit 1
+    fi
+
+    WILDCARD_DOMAIN="*.${ROOT_DOMAIN}"
+    echo -e "${GREEN}识别主域名: ${ROOT_DOMAIN}${PLAIN}"
+    echo -e "${GREEN}目标泛域名: ${WILDCARD_DOMAIN}${PLAIN}"
+
+    CERT_FILE="$CERT_DIR/wildcard.${ROOT_DOMAIN}.crt"
+    KEY_FILE="$CERT_DIR/wildcard.${ROOT_DOMAIN}.key"
+    
+    # 检查是否已有证书
+    if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
+         echo -e "${GREEN}检测到现有泛域名证书，跳过申请。${PLAIN}"
+         return
+    fi
+
     # 安装 acme.sh
     if [[ ! -f "$ACME_SH_DIR/acme.sh" ]]; then
-        echo -e "${YELLOW}正在安装 acme.sh...${PLAIN}"
-        curl -s https://get.acme.sh | sh -s email=admin@${DOMAIN}
+        curl -s https://get.acme.sh | sh -s email=admin@${ROOT_DOMAIN}
         source ~/.bashrc 2>/dev/null
     fi
-    
-    # 检查 acme.sh 是否安装成功
-    if [[ ! -f "$ACME_SH_DIR/acme.sh" ]]; then
-        echo -e "${RED}acme.sh 安装失败，请检查网络连接。${PLAIN}"
-        exit 1
-    fi
 
-    # 获取 Cloudflare Token
-    echo -e "${YELLOW}请输入 Cloudflare API Token (仅需 DNS 编辑权限):${PLAIN}"
+    echo -e "${YELLOW}请输入 Cloudflare API Token:${PLAIN}"
     read -p "CF_Token: " CF_TOKEN
-    
-    if [[ -z "$CF_TOKEN" ]]; then
-        echo -e "${RED}错误: Token 不能为空。${PLAIN}"
-        exit 1
-    fi
+    [[ -z "$CF_TOKEN" ]] && echo -e "${RED}Token为空${PLAIN}" && exit 1
 
-    # =========================================================
-    # 核心修改：强制切换默认 CA 为 Let's Encrypt
-    # =========================================================
-    echo -e "${YELLOW}设置默认 CA 为 Let's Encrypt...${PLAIN}"
+    # 强制默认 CA 为 Let's Encrypt
     "$ACME_SH_DIR/acme.sh" --set-default-ca --server letsencrypt
 
-    echo -e "${YELLOW}开始申请证书 (ECC-256)...${PLAIN}"
-    
-    # 传递环境变量并申请
+    echo -e "${YELLOW}开始申请泛域名证书 (${WILDCARD_DOMAIN})...${PLAIN}"
     export CF_Token="$CF_TOKEN"
     
-    # 强制指定 --server letsencrypt 和 -k ec-256 (参考 install.sh)
-    "$ACME_SH_DIR/acme.sh" --issue --server letsencrypt --dns dns_cf -d "$DOMAIN" -k ec-256
+    # 强制 ECC 证书
+    "$ACME_SH_DIR/acme.sh" --issue --server letsencrypt --dns dns_cf -d "$WILDCARD_DOMAIN" -k ec-256
     
-    local RET=$?
-    if [[ $RET -ne 0 ]]; then
-        echo -e "${RED}证书申请失败！错误代码: $RET${PLAIN}"
-        echo -e "${YELLOW}请检查 Token 权限或域名解析是否正确。${PLAIN}"
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}证书申请失败！请检查 Token 或域名解析。${PLAIN}"
         exit 1
     fi
 
-    # 安装证书 (保留 ECC 参数)
-    "$ACME_SH_DIR/acme.sh" --install-cert -d "$DOMAIN" --ecc \
+    # 安装证书
+    "$ACME_SH_DIR/acme.sh" --install-cert -d "$WILDCARD_DOMAIN" --ecc \
         --fullchain-file "$CERT_FILE" \
         --key-file       "$KEY_FILE" \
         --reloadcmd      "systemctl reload caddy"
-        
-    if [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]]; then
-        echo -e "${GREEN}证书安装成功！${PLAIN}"
-    else
-        echo -e "${RED}证书文件未生成，请检查日志。${PLAIN}"
-        exit 1
-    fi
 }
 
-# 5. 配置 Caddy
+# 6. 配置 Caddy
 config_caddy() {
     echo -e "${YELLOW}正在生成配置文件...${PLAIN}"
     read -p "设置 NaiveProxy 用户名 [默认: admin]: " NAIVE_USER
@@ -153,21 +215,26 @@ config_caddy() {
 
     mkdir -p $CADDY_DIR
     mkdir -p /var/www/html
-    
     if [[ ! -f /var/www/html/index.html ]]; then
         echo "<h1>It works!</h1>" > /var/www/html/index.html
     fi
     
-    # 使用生成的证书路径
+    # Caddyfile 配置：直接使用泛域名证书
+    # 监听地址配置为泛域名，这样 Caddy 会匹配该证书下的所有子域名
     cat > $CADDY_DIR/Caddyfile <<EOF
 {
     admin off
     auto_https off
+    servers {
+        protocol {
+            experimental_http3
+        }
+    }
     order forward_proxy before file_server
 }
 
-:$PORT_MAIN, $DOMAIN:$PORT_MAIN {
-    tls $CERT_DIR/${DOMAIN}.crt $CERT_DIR/${DOMAIN}.key
+:$PORT_MAIN, $WILDCARD_DOMAIN:$PORT_MAIN {
+    tls $CERT_DIR/wildcard.${ROOT_DOMAIN}.crt $CERT_DIR/wildcard.${ROOT_DOMAIN}.key
     
     forward_proxy {
         basic_auth $NAIVE_USER $NAIVE_PASS
@@ -183,23 +250,18 @@ config_caddy() {
 EOF
 }
 
-# 6. 配置防火墙与服务
-setup_service_and_firewall() {
-    echo -e "${YELLOW}配置端口转发与系统服务...${PLAIN}"
-    
+# 7. 服务与防火墙
+setup_service() {
+    echo -e "${YELLOW}配置系统服务...${PLAIN}"
     if command -v iptables >/dev/null 2>&1; then
         iptables -t nat -D PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN 2>/dev/null
         iptables -t nat -A PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN
-        
-        if command -v netfilter-persistent >/dev/null 2>&1; then
-            netfilter-persistent save
-        fi
+        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save
     fi
 
     cat > /etc/systemd/system/caddy.service <<EOF
 [Unit]
 Description=Caddy Web Server
-Documentation=https://caddyserver.com/docs/
 After=network.target network-online.target
 Requires=network-online.target
 
@@ -224,45 +286,40 @@ EOF
     systemctl enable caddy
     systemctl restart caddy
     
-    sleep 3
+    sleep 2
     if systemctl is-active --quiet caddy; then
-        echo -e "${GREEN}Caddy 服务启动成功。${PLAIN}"
+        echo -e "${GREEN}Caddy 启动成功！${PLAIN}"
     else
-        echo -e "${RED}Caddy 服务启动失败，请检查日志: journalctl -u caddy -f${PLAIN}"
+        echo -e "${RED}Caddy 启动失败，请检查配置。${PLAIN}"
         exit 1
     fi
 }
 
-# 7. 输出节点信息
-show_node_info() {
+show_info() {
     echo ""
-    echo -e "${GREEN}==============================================${PLAIN}"
-    echo -e "${GREEN}            NaiveProxy 安装完成               ${PLAIN}"
-    echo -e "${GREEN}==============================================${PLAIN}"
-    echo -e "核心监听端口: ${YELLOW}$PORT_MAIN${PLAIN}"
-    echo -e "额外转发端口: ${YELLOW}$PORT_RANGE_START - $PORT_RANGE_END${PLAIN}"
-    echo -e "域名: ${YELLOW}$DOMAIN${PLAIN}"
-    echo -e "用户名: ${YELLOW}$NAIVE_USER${PLAIN}"
-    echo -e "密码: ${YELLOW}$NAIVE_PASS${PLAIN}"
+    echo -e "${GREEN}=== 部署完成 ===${PLAIN}"
+    echo -e "您输入的具体域名: ${YELLOW}${INPUT_DOMAIN}${PLAIN}"
+    echo -e "实际申请的证书:   ${YELLOW}${WILDCARD_DOMAIN}${PLAIN}"
+    echo -e "端口: ${YELLOW}${PORT_MAIN}${PLAIN}"
+    echo -e "用户名: ${YELLOW}${NAIVE_USER}${PLAIN}"
+    echo -e "密码: ${YELLOW}${NAIVE_PASS}${PLAIN}"
     echo ""
     echo -e "${GREEN}客户端配置 (config.json):${PLAIN}"
     echo -e "\033[36m{"
     echo -e "  \"listen\": \"socks://127.0.0.1:1080\","
-    echo -e "  \"proxy\": \"https://$NAIVE_USER:$NAIVE_PASS@$DOMAIN:$PORT_MAIN\""
+    echo -e "  \"proxy\": \"https://$NAIVE_USER:$NAIVE_PASS@$INPUT_DOMAIN:$PORT_MAIN\""
     echo -e "}\033[0m"
-    echo ""
-    echo -e "请确保防火墙已放行 TCP 端口: $PORT_MAIN 以及 $PORT_RANGE_START-$PORT_RANGE_END"
 }
 
-# 主执行流程
 main() {
     check_system
     install_dependencies
+    optimize_system     # 智能优化
     download_caddy
     check_and_issue_cert
     config_caddy
-    setup_service_and_firewall
-    show_node_info
+    setup_service
+    show_info
 }
 
 main
