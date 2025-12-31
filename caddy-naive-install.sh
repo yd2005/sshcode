@@ -2,7 +2,7 @@
 
 # ==============================================================
 # 脚本名称: caddy-smart-install.sh
-# 功能: 智能BBR检测 + 泛域名证书自动推导 + Caddy部署
+# 功能: 智能BBR检测 + 证书有效性预检 + 泛域名自动推导 + Caddy部署
 # 架构: AMD64 / ARM64
 # ==============================================================
 
@@ -26,18 +26,16 @@ PORT_RANGE_END=3610
 # 检查 Root 权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 用户运行此脚本。${PLAIN}" && exit 1
 
-# 1. 智能内核优化 (先检查，后修改)
+# 1. 智能内核优化
 optimize_system() {
     echo -e "${YELLOW}正在检查系统内核状态...${PLAIN}"
     
-    # 检查 BBR 运行状态
     CURRENT_ALGO=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     if [[ "$CURRENT_ALGO" == "bbr" ]]; then
         echo -e "${GREEN}检测到 BBR 已在运行中，跳过重复优化。${PLAIN}"
         return
     fi
 
-    # 检查配置文件是否已修改过
     if grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
         echo -e "${GREEN}检测到 sysctl.conf 已包含 BBR 配置，尝试重新加载...${PLAIN}"
         sysctl -p >/dev/null 2>&1
@@ -46,10 +44,7 @@ optimize_system() {
 
     echo -e "${YELLOW}未检测到优化配置，正在应用内核优化 (参考 v2ray-agent)...${PLAIN}"
     
-    # 备份原配置
     cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%F)
-
-    # 写入优化参数
     cat >> /etc/sysctl.conf <<EOF
 
 # Caddy-Naive-Optimized
@@ -75,16 +70,13 @@ net.ipv4.tcp_wmem = 4096 65536 16777216
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
-
-    # 应用参数
     sysctl -p >/dev/null 2>&1
-    echo -e "${GREEN}内核参数优化已完成，BBR 已开启。${PLAIN}"
-
-    # 调整 ulimit
+    
     if ! grep -q "ulimit -SHn 65535" /etc/profile; then
         echo "ulimit -SHn 65535" >> /etc/profile
         ulimit -SHn 65535
     fi
+    echo -e "${GREEN}内核参数优化已完成。${PLAIN}"
 }
 
 # 2. 系统架构检测
@@ -136,7 +128,7 @@ download_caddy() {
     fi
 }
 
-# 5. 证书申请 (输入子域名 -> 提取主域名 -> 申请泛域名)
+# 5. 证书申请 (含有效性检查)
 check_and_issue_cert() {
     mkdir -p "$CERT_DIR"
     
@@ -144,7 +136,7 @@ check_and_issue_cert() {
     echo -e "${YELLOW}   泛域名证书申请 (Wildcard Certificate)         ${PLAIN}"
     echo -e "${YELLOW}=================================================${PLAIN}"
     echo -e "${YELLOW}请输入具体的节点域名 (例如: vps.google.com)${PLAIN}"
-    echo -e "${YELLOW}脚本将自动提取 google.com 并申请 *.google.com${PLAIN}"
+    echo -e "${YELLOW}脚本将自动提取 google.com 并申请/复用 *.google.com${PLAIN}"
     read -p "具体域名: " INPUT_DOMAIN
     
     if [[ -z "$INPUT_DOMAIN" ]]; then
@@ -152,12 +144,10 @@ check_and_issue_cert() {
         exit 1
     fi
 
-    # 核心逻辑：从 input.domain.com 提取 domain.com
-    # 使用 Shell 参数扩展，删除第一个点及其左边的内容
+    # 提取主域名
     ROOT_DOMAIN="${INPUT_DOMAIN#*.}"
-    
     if [[ "$ROOT_DOMAIN" == "$INPUT_DOMAIN" ]]; then
-         echo -e "${RED}错误：请输入二级或多级域名 (例如 abc.example.com)，不要直接输入 example.com${PLAIN}"
+         echo -e "${RED}错误：请输入二级或多级域名 (例如 abc.example.com)${PLAIN}"
          exit 1
     fi
 
@@ -168,158 +158,29 @@ check_and_issue_cert() {
     CERT_FILE="$CERT_DIR/wildcard.${ROOT_DOMAIN}.crt"
     KEY_FILE="$CERT_DIR/wildcard.${ROOT_DOMAIN}.key"
     
-    # 检查是否已有证书
-    if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
-         echo -e "${GREEN}检测到现有泛域名证书，跳过申请。${PLAIN}"
-         return
+    # ================= 关键修改：证书有效性检查 =================
+    NEED_ISSUE=1
+    if [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]]; then
+        # 检查证书是否在 30 天内过期 (2592000秒)
+        # 如果返回 0，表示证书在未来 30 天内依然有效，无需重新申请
+        if openssl x509 -checkend 2592000 -noout -in "$CERT_FILE" >/dev/null 2>&1; then
+            echo -e "${GREEN}检测到有效的泛域名证书 (有效期 > 30天)，跳过申请步骤。${PLAIN}"
+            NEED_ISSUE=0
+        else
+            echo -e "${YELLOW}现有证书不存在或即将过期，准备申请...${PLAIN}"
+        fi
     fi
 
-    # 安装 acme.sh
-    if [[ ! -f "$ACME_SH_DIR/acme.sh" ]]; then
-        curl -s https://get.acme.sh | sh -s email=admin@${ROOT_DOMAIN}
-        source ~/.bashrc 2>/dev/null
-    fi
+    # 只有需要申请时才执行后续步骤
+    if [[ "$NEED_ISSUE" -eq 1 ]]; then
+        # 安装 acme.sh
+        if [[ ! -f "$ACME_SH_DIR/acme.sh" ]]; then
+            curl -s https://get.acme.sh | sh -s email=admin@${ROOT_DOMAIN}
+            source ~/.bashrc 2>/dev/null
+        fi
 
-    echo -e "${YELLOW}请输入 Cloudflare API Token:${PLAIN}"
-    read -p "CF_Token: " CF_TOKEN
-    [[ -z "$CF_TOKEN" ]] && echo -e "${RED}Token为空${PLAIN}" && exit 1
+        echo -e "${YELLOW}请输入 Cloudflare API Token:${PLAIN}"
+        read -p "CF_Token: " CF_TOKEN
+        [[ -z "$CF_TOKEN" ]] && echo -e "${RED}Token为空${PLAIN}" && exit 1
 
-    # 强制默认 CA 为 Let's Encrypt
-    "$ACME_SH_DIR/acme.sh" --set-default-ca --server letsencrypt
-
-    echo -e "${YELLOW}开始申请泛域名证书 (${WILDCARD_DOMAIN})...${PLAIN}"
-    export CF_Token="$CF_TOKEN"
-    
-    # 强制 ECC 证书
-    "$ACME_SH_DIR/acme.sh" --issue --server letsencrypt --dns dns_cf -d "$WILDCARD_DOMAIN" -k ec-256
-    
-    if [[ $? -ne 0 ]]; then
-        echo -e "${RED}证书申请失败！请检查 Token 或域名解析。${PLAIN}"
-        exit 1
-    fi
-
-    # 安装证书
-    "$ACME_SH_DIR/acme.sh" --install-cert -d "$WILDCARD_DOMAIN" --ecc \
-        --fullchain-file "$CERT_FILE" \
-        --key-file       "$KEY_FILE" \
-        --reloadcmd      "systemctl reload caddy"
-}
-
-# 6. 配置 Caddy
-config_caddy() {
-    echo -e "${YELLOW}正在生成配置文件...${PLAIN}"
-    read -p "设置 NaiveProxy 用户名 [默认: admin]: " NAIVE_USER
-    [[ -z "$NAIVE_USER" ]] && NAIVE_USER="admin"
-    read -p "设置 NaiveProxy 密码 [默认: admin]: " NAIVE_PASS
-    [[ -z "$NAIVE_PASS" ]] && NAIVE_PASS="admin"
-
-    mkdir -p $CADDY_DIR
-    mkdir -p /var/www/html
-    if [[ ! -f /var/www/html/index.html ]]; then
-        echo "<h1>It works!</h1>" > /var/www/html/index.html
-    fi
-    
-    # Caddyfile 配置：直接使用泛域名证书
-    # 监听地址配置为泛域名，这样 Caddy 会匹配该证书下的所有子域名
-    cat > $CADDY_DIR/Caddyfile <<EOF
-{
-    admin off
-    auto_https off
-    servers {
-        protocol {
-            experimental_http3
-        }
-    }
-    order forward_proxy before file_server
-}
-
-:$PORT_MAIN, $WILDCARD_DOMAIN:$PORT_MAIN {
-    tls $CERT_DIR/wildcard.${ROOT_DOMAIN}.crt $CERT_DIR/wildcard.${ROOT_DOMAIN}.key
-    
-    forward_proxy {
-        basic_auth $NAIVE_USER $NAIVE_PASS
-        hide_ip
-        hide_via
-        probe_resistance
-    }
-    
-    file_server {
-        root /var/www/html
-    }
-}
-EOF
-}
-
-# 7. 服务与防火墙
-setup_service() {
-    echo -e "${YELLOW}配置系统服务...${PLAIN}"
-    if command -v iptables >/dev/null 2>&1; then
-        iptables -t nat -D PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN 2>/dev/null
-        iptables -t nat -A PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN
-        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save
-    fi
-
-    cat > /etc/systemd/system/caddy.service <<EOF
-[Unit]
-Description=Caddy Web Server
-After=network.target network-online.target
-Requires=network-online.target
-
-[Service]
-User=root
-Group=root
-ExecStart=/usr/bin/caddy run --environ --config $CADDY_DIR/Caddyfile
-ExecReload=/usr/bin/caddy reload --config $CADDY_DIR/Caddyfile
-TimeoutStopSec=5s
-LimitNOFILE=1048576
-LimitNPROC=512
-PrivateTmp=true
-ProtectSystem=full
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable caddy
-    systemctl restart caddy
-    
-    sleep 2
-    if systemctl is-active --quiet caddy; then
-        echo -e "${GREEN}Caddy 启动成功！${PLAIN}"
-    else
-        echo -e "${RED}Caddy 启动失败，请检查配置。${PLAIN}"
-        exit 1
-    fi
-}
-
-show_info() {
-    echo ""
-    echo -e "${GREEN}=== 部署完成 ===${PLAIN}"
-    echo -e "您输入的具体域名: ${YELLOW}${INPUT_DOMAIN}${PLAIN}"
-    echo -e "实际申请的证书:   ${YELLOW}${WILDCARD_DOMAIN}${PLAIN}"
-    echo -e "端口: ${YELLOW}${PORT_MAIN}${PLAIN}"
-    echo -e "用户名: ${YELLOW}${NAIVE_USER}${PLAIN}"
-    echo -e "密码: ${YELLOW}${NAIVE_PASS}${PLAIN}"
-    echo ""
-    echo -e "${GREEN}客户端配置 (config.json):${PLAIN}"
-    echo -e "\033[36m{"
-    echo -e "  \"listen\": \"socks://127.0.0.1:1080\","
-    echo -e "  \"proxy\": \"https://$NAIVE_USER:$NAIVE_PASS@$INPUT_DOMAIN:$PORT_MAIN\""
-    echo -e "}\033[0m"
-}
-
-main() {
-    check_system
-    install_dependencies
-    optimize_system     # 智能优化
-    download_caddy
-    check_and_issue_cert
-    config_caddy
-    setup_service
-    show_info
-}
-
-main
+        # 强制默认 CA 为 Let's Enc
