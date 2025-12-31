@@ -136,4 +136,161 @@ check_and_issue_cert() {
         echo -e "${YELLOW}正在验证 Token...${PLAIN}"
         CF_ACCOUNT_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
              -H "Authorization: Bearer $CF_TOKEN" \
-             -H "Content-Type:application
+             -H "Content-Type:application/json" | jq -r '.result.id' 2>/dev/null)
+        
+        if [[ -n "$CF_ACCOUNT_ID" && "$CF_ACCOUNT_ID" != "null" ]]; then
+             export CF_Account_ID="$CF_ACCOUNT_ID"
+        fi
+
+        echo -e "${YELLOW}开始申请证书...${PLAIN}"
+        $ACME_SH_DIR/acme.sh --issue --server letsencrypt --dns dns_cf -d "$DOMAIN"
+        
+        if [[ $? -ne 0 ]]; then
+            echo -e "${RED}证书申请失败！请检查 Token 权限或域名解析。${PLAIN}"
+            exit 1
+        fi
+
+        # 安装证书到指定目录
+        $ACME_SH_DIR/acme.sh --install-cert -d "$DOMAIN" \
+            --key-file       "$KEY_FILE"  \
+            --fullchain-file "$CERT_FILE" \
+            --reloadcmd     "systemctl reload caddy"
+            
+        echo -e "${GREEN}证书申请并安装成功。${PLAIN}"
+    fi
+}
+
+# 5. 配置 Caddy
+config_caddy() {
+    echo -e "${YELLOW}==============================================${PLAIN}"
+    echo -e "${YELLOW}              NaiveProxy 用户配置             ${PLAIN}"
+    echo -e "${YELLOW}==============================================${PLAIN}"
+    
+    read -p "设置 NaiveProxy 用户名 [默认: admin]: " NAIVE_USER
+    [[ -z "$NAIVE_USER" ]] && NAIVE_USER="admin"
+    read -p "设置 NaiveProxy 密码 [默认: admin]: " NAIVE_PASS
+    [[ -z "$NAIVE_PASS" ]] && NAIVE_PASS="admin"
+
+    mkdir -p $CADDY_DIR
+    mkdir -p /var/www/html
+    
+    # 写入伪装页面
+    if [[ ! -f /var/www/html/index.html ]]; then
+        echo "<h1>It works!</h1>" > /var/www/html/index.html
+    fi
+    
+    # 生成 Caddyfile
+    echo -e "${YELLOW}正在生成配置文件...${PLAIN}"
+    cat > $CADDY_DIR/Caddyfile <<EOF
+{
+    admin off
+    auto_https off
+    order forward_proxy before file_server
+}
+
+:$PORT_MAIN, $DOMAIN:$PORT_MAIN {
+    tls $CERT_DIR/fullchain.pem $CERT_DIR/privkey.pem
+    
+    forward_proxy {
+        basic_auth $NAIVE_USER $NAIVE_PASS
+        hide_ip
+        hide_via
+        probe_resistance
+    }
+    
+    file_server {
+        root /var/www/html
+    }
+}
+EOF
+}
+
+# 6. 配置防火墙与服务
+setup_service_and_firewall() {
+    echo -e "${YELLOW}配置端口转发与系统服务...${PLAIN}"
+    
+    # 配置 iptables 端口转发 (3600-3610 -> 8443)
+    # 仅在 iptables 存在时执行
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -t nat -D PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN 2>/dev/null
+        iptables -t nat -A PREROUTING -p tcp --dport $PORT_RANGE_START:$PORT_RANGE_END -j REDIRECT --to-port $PORT_MAIN
+        
+        # 尝试保存规则 (兼容 Debian/Ubuntu)
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save
+        fi
+    fi
+
+    # 创建 Systemd 服务文件
+    cat > /etc/systemd/system/caddy.service <<EOF
+[Unit]
+Description=Caddy Web Server
+Documentation=https://caddyserver.com/docs/
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+User=root
+Group=root
+ExecStart=/usr/bin/caddy run --environ --config $CADDY_DIR/Caddyfile
+ExecReload=/usr/bin/caddy reload --config $CADDY_DIR/Caddyfile
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+LimitNPROC=512
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 启动服务
+    systemctl daemon-reload
+    systemctl enable caddy
+    systemctl restart caddy
+    
+    sleep 3
+    if systemctl is-active --quiet caddy; then
+        echo -e "${GREEN}Caddy 服务启动成功。${PLAIN}"
+    else
+        echo -e "${RED}Caddy 服务启动失败，请检查日志: journalctl -u caddy -f${PLAIN}"
+        exit 1
+    fi
+}
+
+# 7. 输出节点信息
+show_node_info() {
+    echo ""
+    echo -e "${GREEN}==============================================${PLAIN}"
+    echo -e "${GREEN}            NaiveProxy 安装完成               ${PLAIN}"
+    echo -e "${GREEN}==============================================${PLAIN}"
+    echo -e "核心监听端口: ${YELLOW}$PORT_MAIN${PLAIN}"
+    echo -e "额外转发端口: ${YELLOW}$PORT_RANGE_START - $PORT_RANGE_END${PLAIN}"
+    echo -e "域名: ${YELLOW}$DOMAIN${PLAIN}"
+    echo -e "用户名: ${YELLOW}$NAIVE_USER${PLAIN}"
+    echo -e "密码: ${YELLOW}$NAIVE_PASS${PLAIN}"
+    echo ""
+    echo -e "${GREEN}客户端配置 (config.json):${PLAIN}"
+    echo -e "\033[36m{"
+    echo -e "  \"listen\": \"socks://127.0.0.1:1080\","
+    echo -e "  \"proxy\": \"https://$NAIVE_USER:$NAIVE_PASS@$DOMAIN:$PORT_MAIN\""
+    echo -e "}\033[0m"
+    echo ""
+    echo -e "请确保防火墙已放行 TCP 端口: $PORT_MAIN 以及 $PORT_RANGE_START-$PORT_RANGE_END"
+}
+
+# 主执行流程
+main() {
+    check_system
+    install_dependencies
+    # install_go (已移除)
+    download_caddy # (替代 compile_caddy)
+    check_and_issue_cert
+    config_caddy
+    setup_service_and_firewall
+    show_node_info
+}
+
+main
