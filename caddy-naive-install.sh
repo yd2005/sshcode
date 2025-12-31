@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ==============================================================
-# 脚本名称: caddy-final-fix.sh
+# 脚本名称: caddy-urgent-fix.sh
 # 功能: 修复 Caddyfile 配置错误 + 智能容错证书 + 泛域名
-# 修复: 彻底移除了导致启动失败的 experimental_http3 配置
+# 修复: 彻底删除了 servers { protocol... } 代码块
 # ==============================================================
 
 # 颜色定义
@@ -205,7 +205,7 @@ config_caddy() {
         echo "<h1>It works!</h1>" > /var/www/html/index.html
     fi
     
-# 【关键修复】这里彻底移除了 servers { protocol } 配置
+# 【重要修正】彻底删除了 servers { protocol... } 块
 cat > $CADDY_DIR/Caddyfile <<EOF_CADDY
 {
     admin off
@@ -266,11 +266,13 @@ EOF_SERVICE
     systemctl enable caddy
     systemctl restart caddy
     
-    sleep 2
+    sleep 3
     if systemctl is-active --quiet caddy; then
-        echo -e "${GREEN}Caddy 启动成功！${PLAIN}"
+        echo -e "${GREEN}Caddy 启动成功！服务已运行。${PLAIN}"
+        echo -e "${GREEN}日志查看: journalctl -u caddy -f${PLAIN}"
     else
-        echo -e "${RED}Caddy 启动失败，请检查配置。${PLAIN}"
+        echo -e "${RED}Caddy 启动失败！${PLAIN}"
+        echo -e "${YELLOW}请运行: journalctl -u caddy --no-pager | tail -n 20 查看错误${PLAIN}"
         exit 1
     fi
 }
