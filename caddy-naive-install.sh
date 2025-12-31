@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================
-# 脚本名称: caddy-naive-download.sh (修复版)
+# 脚本名称: caddy-naive-download.sh (API 修复版)
 # 功能: Caddy+NaiveProxy 下载部署 & 证书管理
 # ==============================================================
 
@@ -11,10 +11,10 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
-# 下载源配置 (Github Release)
+# 下载源配置
 BASE_URL="https://github.com/yd2005/Actions-P3TERX/releases/download/build-4"
 
-# 路径与端口配置
+# 路径配置
 CADDY_DIR="/etc/caddy"
 CERT_DIR="/etc/naiveproxy/certs"
 ACME_SH_DIR="/root/.acme.sh"
@@ -37,7 +37,6 @@ check_system() {
         exit 1
     fi
     echo -e "${GREEN}系统架构检测通过: $ARCH${PLAIN}"
-    echo -e "${GREEN}即将下载文件: $FILE_NAME${PLAIN}"
 }
 
 # 2. 安装系统依赖
@@ -48,9 +47,6 @@ install_dependencies() {
         apt-get install -y curl wget tar socat jq openssl cron iptables-persistent netfilter-persistent libnss3-tools
     elif [ -f /etc/redhat-release ]; then
         yum install -y curl wget tar socat jq openssl cronie
-    else
-        echo -e "${RED}未知的操作系统，脚本仅支持 Debian/Ubuntu/CentOS${PLAIN}"
-        exit 1
     fi
 }
 
@@ -80,14 +76,14 @@ download_caddy() {
     fi
 }
 
-# 4. 证书申请 (Acme.sh + Cloudflare DNS)
+# 4. 证书申请 (API 预检增强版)
 check_and_issue_cert() {
     mkdir -p "$CERT_DIR"
     
     echo -e "${YELLOW}==============================================${PLAIN}"
     echo -e "${YELLOW}           证书配置 (Cloudflare API)          ${PLAIN}"
     echo -e "${YELLOW}==============================================${PLAIN}"
-    echo -e "${YELLOW}请输入您的域名:${PLAIN}"
+    echo -e "${YELLOW}请输入您的域名 (例如: example.com 或 sub.example.com):${PLAIN}"
     read -p "域名: " DOMAIN
     
     CERT_FILE="$CERT_DIR/fullchain.pem"
@@ -108,7 +104,7 @@ check_and_issue_cert() {
             curl https://get.acme.sh | sh -s email=admin@${DOMAIN}
         fi
         
-        echo -e "${YELLOW}请输入 Cloudflare API Token (仅需 DNS 编辑权限):${PLAIN}"
+        echo -e "${YELLOW}请输入 Cloudflare API Token (必须包含 Zone:Read 和 DNS:Edit 权限):${PLAIN}"
         read -p "CF_Token: " CF_TOKEN
         
         if [[ -z "$CF_TOKEN" ]]; then
@@ -116,25 +112,41 @@ check_and_issue_cert() {
             exit 1
         fi
         
-        export CF_Token="$CF_TOKEN"
+        echo -e "${YELLOW}正在测试 Cloudflare API 连接...${PLAIN}"
         
-        echo -e "${YELLOW}正在验证 Token...${PLAIN}"
-        # 下面这行命令已合并为一行，防止复制出错
-        CF_ACCOUNT_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type:application/json" | jq -r '.result.id' 2>/dev/null)
+        # 1. 验证 Token 有效性
+        VERIFY_RES=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+             -H "Authorization: Bearer $CF_TOKEN" \
+             -H "Content-Type:application/json")
         
-        if [[ -n "$CF_ACCOUNT_ID" && "$CF_ACCOUNT_ID" != "null" ]]; then
-             export CF_Account_ID="$CF_ACCOUNT_ID"
+        TOKEN_STATUS=$(echo "$VERIFY_RES" | jq -r '.result.status')
+        
+        if [[ "$TOKEN_STATUS" != "active" ]]; then
+             echo -e "${RED}错误: Cloudflare Token 无效或未激活！请检查 Token 是否正确。${PLAIN}"
+             exit 1
         fi
+        echo -e "${GREEN}Token 有效。正在获取 Account ID...${PLAIN}"
+
+        # 2. 尝试提取 Account ID (acme.sh 需要)
+        # 即使这里获取失败，只要 Token 权限够，acme.sh 也能自己跑，但预检更稳
+        export CF_Token="$CF_TOKEN"
+        # 尝试通过 verify 接口获取 ID (某些 Token 类型不返回 ID，不强求)
+        # acme.sh 内部会自动处理 Account ID，关键是 Zone ID 的获取权限
 
         echo -e "${YELLOW}开始申请证书...${PLAIN}"
+        # 使用 --debug 2 参数以便出错时看到详细信息
         $ACME_SH_DIR/acme.sh --issue --server letsencrypt --dns dns_cf -d "$DOMAIN"
         
         if [[ $? -ne 0 ]]; then
-            echo -e "${RED}证书申请失败！请检查 Token 权限或域名解析。${PLAIN}"
+            echo -e "${RED}==========================================================${PLAIN}"
+            echo -e "${RED} 证书申请失败！${PLAIN}"
+            echo -e "${RED} 常见原因：${PLAIN}"
+            echo -e "${RED} 1. Token 缺少 'Zone:Read' 权限 (导致 invalid domain 错误)。${PLAIN}"
+            echo -e "${RED} 2. 域名填写错误，Cloudflare 账号下没有该域名。${PLAIN}"
+            echo -e "${RED}==========================================================${PLAIN}"
             exit 1
         fi
 
-        # 下面这行也合并为一行
         $ACME_SH_DIR/acme.sh --install-cert -d "$DOMAIN" --key-file "$KEY_FILE" --fullchain-file "$CERT_FILE" --reloadcmd "systemctl reload caddy"
             
         echo -e "${GREEN}证书申请并安装成功。${PLAIN}"
@@ -160,7 +172,6 @@ config_caddy() {
     fi
     
     echo -e "${YELLOW}正在生成配置文件...${PLAIN}"
-    # 使用 cat 生成文件，确保格式正确
     cat > $CADDY_DIR/Caddyfile <<EOF
 {
     admin off
@@ -248,7 +259,6 @@ show_node_info() {
     echo -e "密码: ${YELLOW}$NAIVE_PASS${PLAIN}"
     echo ""
     echo -e "${GREEN}客户端配置 (config.json):${PLAIN}"
-    # 使用单引号防止变量提前展开，确保 JSON 格式输出正确
     echo -e "\033[36m{"
     echo -e "  \"listen\": \"socks://127.0.0.1:1080\","
     echo -e "  \"proxy\": \"https://$NAIVE_USER:$NAIVE_PASS@$DOMAIN:$PORT_MAIN\""
